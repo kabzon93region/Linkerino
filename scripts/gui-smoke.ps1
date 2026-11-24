@@ -1,5 +1,7 @@
 param(
-    [string]$Exe = 'build\win32\Release\Linkerino.exe'
+    [string]$Exe = 'build\win32\Release\Linkerino.exe',
+    [string]$Source,
+    [string]$DestParent
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,14 +84,32 @@ function Assert-True {
 }
 
 $script:failed = $false
-$root = Join-Path $env:TEMP ("linkerino-gui-" + [guid]::NewGuid().ToString('N'))
-$source = Join-Path $root 'src\Data'
-$destParent = Join-Path $root 'dest'
+$createdRoot = $false
+if (-not $Source -or -not $DestParent) {
+    $root = Join-Path $env:TEMP ("linkerino-gui-" + [guid]::NewGuid().ToString('N'))
+    $createdRoot = $true
+    if (-not $Source) { $Source = Join-Path $root 'src\Data' }
+    if (-not $DestParent) { $DestParent = Join-Path $root 'dest' }
+}
+$source = $Source
+$destParent = $DestParent
 $destFinal = Join-Path $destParent 'Data'
-New-Item -ItemType Directory -Path (Join-Path $source 'nested'), $destParent -Force | Out-Null
+if (-not (Test-Path -LiteralPath $destParent)) {
+    New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+}
+if (-not (Test-Path -LiteralPath $source)) {
+    New-Item -ItemType Directory -Path $source -Force | Out-Null
+}
+New-Item -ItemType Directory -Path (Join-Path $source 'nested') -Force | Out-Null
 Set-Content -LiteralPath (Join-Path $source 'hello.txt') -Value 'hello world' -Encoding UTF8
 Set-Content -LiteralPath (Join-Path $source 'nested\data.bin') -Value 'payload' -Encoding UTF8
 
+$journalDir = Join-Path $env:LOCALAPPDATA 'Linkerino'
+if (Test-Path -LiteralPath $journalDir) {
+    Get-ChildItem -LiteralPath $journalDir -Filter 'journal-*.txt' -ErrorAction SilentlyContinue |
+        Where-Object { (Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8) -match 'linkerino-(gui|fs)-' } |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+}
 if (-not (Test-Path -LiteralPath $Exe)) {
     Write-Output ("FAIL: executable not found: " + $Exe)
     exit 1
@@ -155,7 +175,9 @@ if (-not $process.WaitForExit(10000)) {
 try {
     [System.IO.Directory]::Delete($source)
 } catch { }
-Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+if ($createdRoot) {
+    Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 if ($script:failed) {
     Write-Output 'RESULT: FAIL'

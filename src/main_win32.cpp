@@ -162,6 +162,7 @@ void StartTransfer(HWND window) {
     }
     const Plan plan = BuildPlan(GetText(g_source_edit), GetText(g_dest_edit));
     if (!plan.valid) {
+        LogLine(L"plan rejected: " + plan.error);
         MessageBoxW(window, plan.error.c_str(), L"Проверка путей", MB_OK | MB_ICONWARNING);
         return;
     }
@@ -418,6 +419,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             EnableWindow(g_cancel, FALSE);
             if (outcome != nullptr) {
                 std::wstring text = outcome->message;
+                if (!outcome->notes.empty()) {
+                    text += L"\n\n" + outcome->notes;
+                }
                 if (!outcome->detail.empty()) {
                     text += L"\n\nПодробности: " + outcome->detail;
                 }

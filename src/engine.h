@@ -56,6 +56,7 @@ struct Outcome {
     bool needs_elevation = false;
     std::wstring message;
     std::wstring detail;
+    std::wstring notes;
     std::wstring leftover;
     std::wstring dest_final;
 };

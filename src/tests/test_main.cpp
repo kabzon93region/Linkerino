@@ -1,6 +1,8 @@
 #include "engine.h"
 #include "win_util.h"
 
+#include <winioctl.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -40,6 +42,29 @@ public:
 private:
     HANDLE handle_;
 };
+
+struct EntryInfo {
+    std::uint64_t volume_serial = 0;
+    std::uint64_t file_index = 0;
+    DWORD links = 0;
+};
+
+bool ReadEntryInfo(const std::wstring& path, EntryInfo& info) {
+    Handle file(CreateFileW(ApiPath(path).c_str(), FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0,
+                            nullptr));
+    if (!file.valid()) {
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION data = {};
+    if (!GetFileInformationByHandle(file.get(), &data)) {
+        return false;
+    }
+    info.volume_serial = data.dwVolumeSerialNumber;
+    info.file_index = (static_cast<std::uint64_t>(data.nFileIndexHigh) << 32) | data.nFileIndexLow;
+    info.links = data.nNumberOfLinks;
+    return true;
+}
 
 std::wstring TempRoot() {
     wchar_t buffer[MAX_PATH] = {0};
@@ -310,50 +335,169 @@ void TestRejectSymlinkSource() {
     RemoveTree(root);
 }
 
-void TestRejectReparseInside() {
-    std::wprintf(L"reject reparse inside tree\n");
+bool CreateJunction(const std::wstring& link, const std::wstring& target) {
+    const std::wstring command = L"cmd.exe /c mklink /J \"" + link + L"\" \"" + target + L"\" >nul";
+    std::vector<wchar_t> buffer(command.begin(), command.end());
+    buffer.push_back(L'\0');
+    STARTUPINFOW info = {};
+    info.cb = sizeof(info);
+    PROCESS_INFORMATION process = {};
+    if (!CreateProcessW(nullptr, buffer.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &info,
+                        &process)) {
+        return false;
+    }
+    WaitForSingleObject(process.hProcess, 30000);
+    DWORD code = 1;
+    GetExitCodeProcess(process.hProcess, &code);
+    CloseHandle(process.hProcess);
+    CloseHandle(process.hThread);
+    return code == 0;
+}
+
+bool ReadSubstituteName(const std::wstring& path, std::wstring& substitute) {
+    Handle handle(CreateFileW(ApiPath(path).c_str(), FILE_READ_ATTRIBUTES,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                              FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!handle.valid()) {
+        return false;
+    }
+    std::vector<BYTE> buffer(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+    DWORD returned = 0;
+    if (!DeviceIoControl(handle.get(), FSCTL_GET_REPARSE_POINT, nullptr, 0, buffer.data(),
+                         static_cast<DWORD>(buffer.size()), &returned, nullptr)) {
+        return false;
+    }
+    const auto* header = reinterpret_cast<const ULONG*>(buffer.data());
+    const ULONG tag = header[0];
+    const auto* data = reinterpret_cast<const USHORT*>(buffer.data());
+    const USHORT substitute_offset = data[4];
+    const USHORT substitute_length = data[5];
+    const std::size_t base = tag == IO_REPARSE_TAG_SYMLINK ? 20 : 16;
+    const std::size_t start = base + substitute_offset;
+    if (substitute_length == 0 || start + substitute_length > returned) {
+        return false;
+    }
+    substitute.assign(reinterpret_cast<const WCHAR*>(buffer.data() + start), substitute_length / sizeof(WCHAR));
+    return true;
+}
+
+void TestReparseInsideCopied() {
+    std::wprintf(L"symlink inside tree copied\n");
     const std::wstring root = TempRoot();
     const std::wstring source = JoinPath(root, L"src\\Data");
     const std::wstring dest_parent = JoinPath(root, L"dest");
-    MakeDirs(source);
+    MakeDirs(JoinPath(source, L"data"));
     MakeDirs(dest_parent);
-    WriteBytes(JoinPath(source, L"file.txt"), "data");
+    WriteBytes(JoinPath(source, L"data\\file.txt"), "linked payload");
+    const std::wstring link_path = JoinPath(source, L"inner");
     std::wstring error;
-    if (!CreateSymlinkCompat(JoinPath(source, L"inner"), JoinPath(source, L"file.txt"), error)) {
+    if (!CreateSymlinkCompat(link_path, JoinPath(source, L"data"), error)) {
         std::wprintf(L"  (probe symlink failed: %ls)\n", error.c_str());
         RemoveTree(root);
         return;
     }
     const Plan plan = BuildPlan(source, dest_parent);
-    Check(plan.valid, L"plan valid before scan");
+    Check(plan.valid, L"plan valid before scan: " + plan.error);
     const Outcome outcome = Execute(plan, nullptr, Faults());
-    Check(!outcome.ok && !outcome.cancelled, L"execute refused reparse point");
-    Check(PathExists(JoinPath(source, L"file.txt")), L"original file still in place");
-    Check(GetFileAttributesW(ApiPath(source).c_str()) != INVALID_FILE_ATTRIBUTES, L"original folder exists");
-    Check(!PathExists(plan.staging), L"staging removed");
+    Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
+    const std::wstring link_copy = JoinPath(plan.dest_final, L"inner");
+    const DWORD attrs = GetFileAttributesW(ApiPath(link_copy).c_str());
+    Check(attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0,
+          L"symlink recreated in the copy");
+    std::wstring substitute;
+    Check(ReadSubstituteName(link_copy, substitute), L"symlink target readable");
+    std::wstring expected = L"\\??\\" + JoinPath(source, L"data");
+    Check(PathsEqual(substitute, expected), L"symlink target preserved: " + substitute);
+    std::string content;
+    Check(ReadBytes(JoinPath(link_copy, L"file.txt"), content) && content == "linked payload",
+          L"data through the recreated link");
     RemoveTree(root);
 }
 
-void TestRejectHardLink() {
-    std::wprintf(L"reject hard link\n");
+void TestRelativeSymlinkInside() {
+    std::wprintf(L"relative symlink inside tree copied\n");
+    const std::wstring root = TempRoot();
+    const std::wstring source = JoinPath(root, L"src\\Data");
+    const std::wstring dest_parent = JoinPath(root, L"dest");
+    MakeDirs(JoinPath(source, L"data"));
+    MakeDirs(dest_parent);
+    WriteBytes(JoinPath(source, L"data\\file.txt"), "relative payload");
+    std::wstring error;
+    if (!CreateSymlinkCompat(JoinPath(source, L"rel"), L"data", error)) {
+        std::wprintf(L"  (relative symlink failed: %ls)\n", error.c_str());
+        RemoveTree(root);
+        return;
+    }
+    const Plan plan = BuildPlan(source, dest_parent);
+    Check(plan.valid, L"plan valid: " + plan.error);
+    const Outcome outcome = Execute(plan, nullptr, Faults());
+    Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
+    std::wstring substitute;
+    Check(ReadSubstituteName(JoinPath(plan.dest_final, L"rel"), substitute), L"relative link target readable");
+    Check(PathsEqual(substitute, L"data"), L"relative target preserved: " + substitute);
+    std::string content;
+    Check(ReadBytes(JoinPath(plan.dest_final, L"rel\\file.txt"), content) && content == "relative payload",
+          L"relative link works in the copy");
+    RemoveTree(root);
+}
+
+void TestJunctionInsideCopied() {
+    std::wprintf(L"junction inside tree copied\n");
+    const std::wstring root = TempRoot();
+    const std::wstring source = JoinPath(root, L"src\\Data");
+    const std::wstring external = JoinPath(root, L"external");
+    const std::wstring dest_parent = JoinPath(root, L"dest");
+    MakeDirs(source);
+    MakeDirs(external);
+    MakeDirs(dest_parent);
+    WriteBytes(JoinPath(external, L"payload.txt"), "junction payload");
+    const std::wstring junction = JoinPath(source, L"junction");
+    if (!CreateJunction(junction, external)) {
+        std::wprintf(L"  (junction creation failed)\n");
+        RemoveTree(root);
+        return;
+    }
+    const Plan plan = BuildPlan(source, dest_parent);
+    Check(plan.valid, L"plan valid: " + plan.error);
+    const Outcome outcome = Execute(plan, nullptr, Faults());
+    Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
+    const std::wstring junction_copy = JoinPath(plan.dest_final, L"junction");
+    const DWORD attrs = GetFileAttributesW(ApiPath(junction_copy).c_str());
+    Check(attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0,
+          L"junction recreated");
+    std::wstring substitute;
+    Check(ReadSubstituteName(junction_copy, substitute), L"junction target readable");
+    Check(PathsEqual(substitute, L"\\??\\" + external), L"junction target preserved: " + substitute);
+    std::string content;
+    Check(ReadBytes(JoinPath(junction_copy, L"payload.txt"), content) && content == "junction payload",
+          L"data through the recreated junction");
+    RemoveTree(root);
+}
+
+void TestHardLinksCopied() {
+    std::wprintf(L"hard links inside tree copied\n");
     const std::wstring root = TempRoot();
     const std::wstring source = JoinPath(root, L"src\\Data");
     const std::wstring dest_parent = JoinPath(root, L"dest");
     MakeDirs(source);
     MakeDirs(dest_parent);
     const std::wstring first = JoinPath(source, L"one.txt");
-    WriteBytes(first, "hard link data");
+    WriteBytes(first, "hard link payload");
     if (!CreateHardLinkW(ApiPath(JoinPath(source, L"two.txt")).c_str(), ApiPath(first).c_str(), nullptr)) {
         std::wprintf(L"  (hard link creation failed)\n");
         RemoveTree(root);
         return;
     }
     const Plan plan = BuildPlan(source, dest_parent);
-    Check(plan.valid, L"plan valid before scan");
+    Check(plan.valid, L"plan valid: " + plan.error);
     const Outcome outcome = Execute(plan, nullptr, Faults());
-    Check(!outcome.ok, L"execute refused hard link");
-    Check(PathExists(first), L"original file still in place");
-    Check(!PathExists(plan.staging), L"staging removed");
+    Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
+    EntryInfo a;
+    EntryInfo b;
+    Check(ReadEntryInfo(JoinPath(plan.dest_final, L"one.txt"), a), L"first link readable");
+    Check(ReadEntryInfo(JoinPath(plan.dest_final, L"two.txt"), b), L"second link readable");
+    Check(a.file_index == b.file_index && a.volume_serial == b.volume_serial, L"both names share one file");
+    Check(a.links == 2, L"hard link count recreated");
     RemoveTree(root);
 }
 
@@ -501,28 +645,60 @@ void TestCrossVolume() {
     RemoveTree(dest_parent);
 }
 
-void TestRootStreamRefused() {
-    std::wprintf(L"directory stream refused\n");
+void TestDirectoryStreamCopied() {
+    std::wprintf(L"directory stream copied\n");
     const std::wstring root = TempRoot();
     const std::wstring source = JoinPath(root, L"src\\Data");
     const std::wstring dest_parent = JoinPath(root, L"dest");
     MakeDirs(source);
     MakeDirs(dest_parent);
     WriteBytes(JoinPath(source, L"a.txt"), "data");
-    Handle stream(CreateFileW(ApiPath(source + L":secret:$DATA").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+    Handle stream(CreateFileW(ApiPath(source + L":DirStream:$DATA").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr));
     if (!stream.valid()) {
         std::wprintf(L"  (skipped: cannot create directory stream, error %lu)\n", GetLastError());
         RemoveTree(root);
         return;
     }
+    DWORD written = 0;
+    WriteFile(stream.get(), "dir-stream-payload", 18, &written, nullptr);
     stream.Close();
     const Plan plan = BuildPlan(source, dest_parent);
     Check(plan.valid, L"plan valid before scan");
     const Outcome outcome = Execute(plan, nullptr, Faults());
-    Check(!outcome.ok && !outcome.cancelled, L"directory stream refused");
-    Check(PathExists(JoinPath(source, L"a.txt")), L"source file intact");
-    Check(!PathExists(plan.dest_final), L"nothing published");
+    Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
+    std::string content;
+    Check(ReadBytes(plan.dest_final + L":DirStream:$DATA", content) && content == "dir-stream-payload",
+          L"directory stream copied to the new place");
+    RemoveTree(root);
+}
+
+void TestLongPath() {
+    std::wprintf(L"long path over 260 characters\n");
+    const std::wstring root = TempRoot();
+    const std::wstring source = JoinPath(root, L"src\\Data");
+    const std::wstring dest_parent = JoinPath(root, L"dest");
+    MakeDirs(source);
+    MakeDirs(dest_parent);
+    std::wstring deep = source;
+    for (int level = 0; level < 12; ++level) {
+        deep = JoinPath(deep, L"directory-with-long-name-" + std::to_wstring(level));
+    }
+    if (!MakeDirs(deep)) {
+        std::wprintf(L"  (skipped: cannot create deep path)\n");
+        RemoveTree(root);
+        return;
+    }
+    WriteBytes(JoinPath(deep, L"deep-file.txt"), "deep payload");
+    Check(deep.size() > 260, L"test path really longer than 260 characters");
+    const Plan plan = BuildPlan(source, dest_parent);
+    Check(plan.valid, L"plan valid: " + plan.error);
+    const Outcome outcome = Execute(plan, nullptr, Faults());
+    Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
+    std::wstring copied = JoinPath(plan.dest_final, deep.substr(source.size() + 1));
+    std::string content;
+    Check(ReadBytes(JoinPath(copied, L"deep-file.txt"), content) && content == "deep payload",
+          L"long path file copied and readable");
     RemoveTree(root);
 }
 
@@ -678,6 +854,143 @@ void TestLinkLostDuringCleanup() {
     RemoveTree(root);
 }
 
+void TestRelativeSymlinkOutside() {
+    std::wprintf(L"relative symlink outside tree copied\n");
+    const std::wstring root = TempRoot();
+    const std::wstring source = JoinPath(root, L"src\\Data");
+    const std::wstring external = JoinPath(root, L"external");
+    const std::wstring dest_parent = JoinPath(root, L"dest");
+    MakeDirs(source);
+    MakeDirs(external);
+    MakeDirs(dest_parent);
+    WriteBytes(JoinPath(external, L"payload.txt"), "outside payload");
+    std::wstring error;
+    if (!CreateSymlinkCompat(JoinPath(source, L"rel"), L"..\\..\\external", error)) {
+        std::wprintf(L"  (relative symlink failed: %ls)\n", error.c_str());
+        RemoveTree(root);
+        return;
+    }
+    const Plan plan = BuildPlan(source, dest_parent);
+    Check(plan.valid, L"plan valid: " + plan.error);
+    const Outcome outcome = Execute(plan, nullptr, Faults());
+    Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
+    std::wstring substitute;
+    Check(ReadSubstituteName(JoinPath(plan.dest_final, L"rel"), substitute), L"link target readable");
+    Check(PathsEqual(substitute, L"\\??\\" + external), L"relative outside link became absolute: " + substitute);
+    std::string content;
+    Check(ReadBytes(JoinPath(plan.dest_final, L"rel\\payload.txt"), content) && content == "outside payload",
+          L"outside link still points to the same place");
+    RemoveTree(root);
+}
+
+void TestBrokenSymlinkCopied() {
+    std::wprintf(L"broken symlink copied\n");
+    const std::wstring root = TempRoot();
+    const std::wstring source = JoinPath(root, L"src\\Data");
+    const std::wstring dest_parent = JoinPath(root, L"dest");
+    MakeDirs(source);
+    MakeDirs(dest_parent);
+    WriteBytes(JoinPath(source, L"file.txt"), "data");
+    const std::wstring missing = JoinPath(source, L"missing-target");
+    std::wstring error;
+    if (!CreateSymlinkCompat(JoinPath(source, L"broken"), missing, error)) {
+        std::wprintf(L"  (symlink failed: %ls)\n", error.c_str());
+        RemoveTree(root);
+        return;
+    }
+    const Plan plan = BuildPlan(source, dest_parent);
+    Check(plan.valid, L"plan valid: " + plan.error);
+    const Outcome outcome = Execute(plan, nullptr, Faults());
+    Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
+    std::wstring substitute;
+    Check(ReadSubstituteName(JoinPath(plan.dest_final, L"broken"), substitute), L"broken link target readable");
+    Check(PathsEqual(substitute, L"\\??\\" + missing), L"broken link target preserved: " + substitute);
+    RemoveTree(root);
+}
+
+void TestHardLinkWithStream() {
+    std::wprintf(L"hard link with stream copied\n");
+    const std::wstring root = TempRoot();
+    const std::wstring source = JoinPath(root, L"src\\Data");
+    const std::wstring dest_parent = JoinPath(root, L"dest");
+    MakeDirs(source);
+    MakeDirs(dest_parent);
+    const std::wstring first = JoinPath(source, L"one.txt");
+    WriteBytes(first, "hard link payload");
+    if (!CreateHardLinkW(ApiPath(JoinPath(source, L"two.txt")).c_str(), ApiPath(first).c_str(), nullptr)) {
+        std::wprintf(L"  (hard link creation failed)\n");
+        RemoveTree(root);
+        return;
+    }
+    if (!WriteStream(first, L"Zone.Identifier", "[ZoneTransfer]\r\nZoneId=3\r\n")) {
+        std::wprintf(L"  (stream creation failed)\n");
+        RemoveTree(root);
+        return;
+    }
+    const Plan plan = BuildPlan(source, dest_parent);
+    Check(plan.valid, L"plan valid: " + plan.error);
+    const Outcome outcome = Execute(plan, nullptr, Faults());
+    Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
+    std::string stream;
+    Check(ReadStream(JoinPath(plan.dest_final, L"two.txt"), L"Zone.Identifier", stream) &&
+              stream.find("ZoneId=3") != std::string::npos,
+          L"stream copied for the hard link");
+    RemoveTree(root);
+}
+
+void TestLongPathWithLinks() {
+    std::wprintf(L"long path with symlink and hard link\n");
+    const std::wstring root = TempRoot();
+    const std::wstring source = JoinPath(root, L"src\\Data");
+    const std::wstring dest_parent = JoinPath(root, L"dest");
+    MakeDirs(source);
+    MakeDirs(dest_parent);
+    std::wstring deep = source;
+    for (int level = 0; level < 12; ++level) {
+        deep = JoinPath(deep, L"directory-with-long-name-" + std::to_wstring(level));
+    }
+    if (!MakeDirs(deep)) {
+        std::wprintf(L"  (skipped: cannot create deep path)\n");
+        RemoveTree(root);
+        return;
+    }
+    const std::wstring file = JoinPath(deep, L"deep.txt");
+    WriteBytes(file, "deep payload");
+    if (!CreateHardLinkW(ApiPath(JoinPath(deep, L"deep-link.txt")).c_str(), ApiPath(file).c_str(), nullptr)) {
+        std::wprintf(L"  (skipped: cannot create hard link on a long path)\n");
+        RemoveTree(root);
+        return;
+    }
+    const std::wstring target_dir = JoinPath(deep, L"target-dir");
+    MakeDirs(target_dir);
+    WriteBytes(JoinPath(target_dir, L"linked.txt"), "long link payload");
+    const std::wstring long_link = JoinPath(deep, L"deep-symlink");
+    std::wstring error;
+    if (!CreateSymlinkCompat(long_link, target_dir, error)) {
+        std::wprintf(L"  (skipped: cannot create symlink on a long path: %ls)\n", error.c_str());
+        RemoveTree(root);
+        return;
+    }
+    const Plan plan = BuildPlan(source, dest_parent);
+    Check(plan.valid, L"plan valid: " + plan.error);
+    const Outcome outcome = Execute(plan, nullptr, Faults());
+    Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
+    std::wstring copied = JoinPath(plan.dest_final, deep.substr(source.size() + 1));
+    EntryInfo one;
+    EntryInfo two;
+    Check(ReadEntryInfo(JoinPath(copied, L"deep.txt"), one), L"long path file readable");
+    Check(ReadEntryInfo(JoinPath(copied, L"deep-link.txt"), two), L"long path hard link readable");
+    Check(one.file_index == two.file_index, L"long path hard link recreated");
+    std::wstring substitute;
+    Check(ReadSubstituteName(JoinPath(copied, L"deep-symlink"), substitute), L"long path symlink readable");
+    Check(PathsEqual(substitute, L"\\??\\" + target_dir), L"long path symlink target preserved: " + substitute);
+    std::string link_content;
+    Check(ReadBytes(JoinPath(copied, L"deep-symlink\\linked.txt"), link_content) &&
+              link_content == "long link payload",
+          L"long path symlink resolves to the copied data");
+    RemoveTree(root);
+}
+
 void TestJournalWritten() {
     std::wprintf(L"journal keeps recovery data\n");
     const std::wstring root = TempRoot();
@@ -758,14 +1071,21 @@ int wmain() {
     TestRejectExistingDestination();
     TestRejectNesting();
     TestRejectSymlinkSource();
-    TestRejectReparseInside();
-    TestRejectHardLink();
+    TestReparseInsideCopied();
+    TestRelativeSymlinkInside();
+    TestJunctionInsideCopied();
+    TestHardLinksCopied();
+    TestHardLinkWithStream();
+    TestDirectoryStreamCopied();
+    TestLongPath();
+    TestLongPathWithLinks();
+    TestRelativeSymlinkOutside();
+    TestBrokenSymlinkCopied();
     TestVerifyFault();
     TestLinkFault();
     TestCancel();
     TestReadOnlySourcePlacement();
     TestCrossVolume();
-    TestRootStreamRefused();
     TestLowSpace();
     TestSourceChangedDuringCopy();
     TestTamperAfterPublish();

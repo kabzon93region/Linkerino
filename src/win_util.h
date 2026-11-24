@@ -73,8 +73,26 @@ void LogLine(const std::wstring& line);
 std::wstring JournalDirectory();
 bool CreateSymlinkCompat(const std::wstring& link, const std::wstring& target, std::wstring& error,
                          DWORD* error_code = nullptr);
+bool CreateSymlinkRaw(const std::wstring& link, const std::wstring& target, bool directory, std::wstring& error,
+                      DWORD* error_code = nullptr);
 DWORD WindowsBuildNumber();
 std::string ToUtf8(const std::wstring& text);
 std::wstring FromUtf8(const std::string& text);
+
+struct FsCapabilities {
+    std::wstring file_system;
+    bool remote = false;
+    bool supports_acl = false;
+    bool supports_streams = false;
+    bool supports_reparse = false;
+    bool supports_hardlinks = false;
+    bool checks_creation_time = true;
+    bool supports_dir_streams = false;
+    DWORD time_tolerance_ms = 0;
+    DWORD attribute_mask = 0;
+};
+
+bool CheckVolumeSupported(const std::wstring& plain, std::wstring& error);
+FsCapabilities ProbeFilesystem(const std::wstring& parent, std::wstring& error);
 
 }  // namespace linkerino

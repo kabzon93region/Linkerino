@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <map>
+#include <utility>
 #include <vector>
 
 namespace linkerino {
@@ -19,7 +21,7 @@ constexpr DWORD kBufferSize = 1u << 20;
 constexpr DWORD kFileAttributeRecallOnOpen = 0x00040000;
 constexpr DWORD kFileAttributeRecallOnDataAccess = 0x00400000;
 constexpr DWORD kMaxDepth = 512;
-constexpr DWORD kMaxStreamPath = MAX_PATH - 32;
+constexpr DWORD kBufferLimit = 32u << 20;
 
 #pragma pack(push, 1)
 struct ReparseDataBufferLocal {
@@ -78,6 +80,17 @@ private:
     HANDLE handle_ = INVALID_HANDLE_VALUE;
 };
 
+struct ReparseInfo {
+    DWORD tag = 0;
+    std::wstring substitute;
+    bool relative = false;
+    bool is_dir = false;
+    std::vector<BYTE> raw;
+    std::wstring resolved;
+    std::wstring inside_rel;
+    std::wstring link_text;
+};
+
 struct Entry {
     std::wstring rel;
     bool is_dir = false;
@@ -92,6 +105,10 @@ struct Entry {
     std::wstring dacl;
     std::vector<EntryStream> streams;
     std::wstring hash;
+    bool is_reparse = false;
+    ReparseInfo reparse;
+    bool hardlink_secondary = false;
+    int hardlink_primary = -1;
 
     std::uint64_t WorkBytes() const {
         std::uint64_t total = size;
@@ -178,6 +195,8 @@ bool Fail(std::wstring& error, const std::wstring& text) {
     error = text;
     return false;
 }
+
+bool HashFile(const std::wstring& plain, std::wstring& hash, std::wstring& error);
 
 std::wstring StreamSuffix(const std::wstring& name) {
     return L":" + name + L":$DATA";
@@ -339,10 +358,12 @@ bool ApplyDacl(const std::wstring& source, const std::wstring& dest, std::wstrin
     return true;
 }
 
-bool ReadMeta(const std::wstring& plain, Entry& entry, std::wstring& error) {
+bool HashStreams(const std::wstring& plain, std::vector<EntryStream>& streams, std::wstring& error);
+
+bool ReadMetaFlags(const std::wstring& plain, DWORD extra_flags, Entry& entry, std::wstring& error) {
     Handle file(CreateFileW(ApiPath(plain).c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                            FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+                            FILE_FLAG_BACKUP_SEMANTICS | extra_flags, nullptr));
     if (!file.valid()) {
         return Fail(error, L"Не удалось открыть " + plain + L": " + Win32ErrorText(GetLastError()));
     }
@@ -362,11 +383,15 @@ bool ReadMeta(const std::wstring& plain, Entry& entry, std::wstring& error) {
     return true;
 }
 
+bool ReadMeta(const std::wstring& plain, Entry& entry, std::wstring& error) {
+    return ReadMetaFlags(plain, 0, entry, error);
+}
+
+bool ReadMetaNoFollow(const std::wstring& plain, Entry& entry, std::wstring& error) {
+    return ReadMetaFlags(plain, FILE_FLAG_OPEN_REPARSE_POINT, entry, error);
+}
+
 bool UnsupportedReason(const Entry& entry, const std::wstring& plain, std::wstring& reason) {
-    if ((entry.attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        reason = L"точка повторной обработки (ссылка, junction или другая): " + plain;
-        return true;
-    }
     if ((entry.attrs & FILE_ATTRIBUTE_ENCRYPTED) != 0) {
         reason = L"зашифрованный файл EFS: " + plain;
         return true;
@@ -379,50 +404,120 @@ bool UnsupportedReason(const Entry& entry, const std::wstring& plain, std::wstri
         reason = L"облачная заглушка, содержимое которой ещё не скачано: " + plain;
         return true;
     }
-    if (!entry.is_dir && entry.links > 1) {
-        reason = L"файл имеет несколько жёстких ссылок: " + plain;
-        return true;
-    }
     return false;
 }
 
-bool EnumNamedStreams(const std::wstring& plain, bool is_dir, std::vector<EntryStream>& out, std::wstring& error) {
-    if (plain.size() >= kMaxStreamPath) {
-        return Fail(error, L"Слишком длинный путь для безопасного переноса (больше " + std::to_wstring(kMaxStreamPath) + L" символов): " + plain);
+std::wstring ReadUnicodeString(const std::vector<BYTE>& buffer, std::size_t base, std::size_t offset,
+                               std::size_t length_bytes) {
+    if (length_bytes == 0 || (length_bytes % sizeof(WCHAR)) != 0) {
+        return std::wstring();
     }
-    WIN32_FIND_STREAM_DATA data = {};
-    FindHandle find(FindFirstStreamW(plain.c_str(), FindStreamInfoStandard, &data, 0));
-    if (!find.valid()) {
+    const std::size_t start = base + offset;
+    if (start + length_bytes > buffer.size()) {
+        return std::wstring();
+    }
+    return std::wstring(reinterpret_cast<const WCHAR*>(buffer.data() + start), length_bytes / sizeof(WCHAR));
+}
+
+bool ReadReparse(const std::wstring& plain, ReparseInfo& info, DWORD attrs, std::wstring& error) {
+    Handle link(CreateFileW(ApiPath(plain).c_str(), FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!link.valid()) {
+        return Fail(error, L"Не удалось открыть ссылку " + plain + L": " + Win32ErrorText(GetLastError()));
+    }
+    std::vector<BYTE> buffer(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+    DWORD returned = 0;
+    if (!DeviceIoControl(link.get(), FSCTL_GET_REPARSE_POINT, nullptr, 0, buffer.data(),
+                         static_cast<DWORD>(buffer.size()), &returned, nullptr)) {
+        return Fail(error, L"Не удалось прочитать ссылку " + plain + L": " + Win32ErrorText(GetLastError()));
+    }
+    buffer.resize(returned);
+    const auto* header = reinterpret_cast<const ReparseDataBufferLocal*>(buffer.data());
+    info.raw = buffer;
+    info.tag = header->ReparseTag;
+    info.is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (header->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+        const auto& symlink = header->SymbolicLinkReparseBuffer;
+        const std::size_t base = offsetof(ReparseDataBufferLocal, SymbolicLinkReparseBuffer) +
+                                 offsetof(decltype(ReparseDataBufferLocal::SymbolicLinkReparseBuffer), PathBuffer);
+        info.substitute =
+            ReadUnicodeString(buffer, base, symlink.SubstituteNameOffset, symlink.SubstituteNameLength);
+        info.relative = (symlink.Flags & 1) != 0;
+        if (info.substitute.empty()) {
+            return Fail(error, L"Ссылка не содержит путь назначения: " + plain);
+        }
+        return true;
+    }
+    if (header->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
+        const auto& mount = header->MountPointReparseBuffer;
+        const std::size_t base = offsetof(ReparseDataBufferLocal, MountPointReparseBuffer) +
+                                 offsetof(decltype(ReparseDataBufferLocal::MountPointReparseBuffer), PathBuffer);
+        info.substitute = ReadUnicodeString(buffer, base, mount.SubstituteNameOffset, mount.SubstituteNameLength);
+        info.relative = false;
+        if (info.substitute.empty()) {
+            return Fail(error, L"Junction не содержит путь назначения: " + plain);
+        }
+        return true;
+    }
+    return Fail(error, L"Неподдерживаемый тип ссылки в " + plain + L" (тег " +
+                           std::to_wstring(header->ReparseTag) + L")");
+}
+
+std::wstring NormalizeLinkTarget(std::wstring target) {
+    if (target.compare(0, 4, L"\\??\\") == 0) {
+        target.erase(0, 4);
+    }
+    if (target.size() >= 4 && _wcsnicmp(target.c_str(), L"UNC\\", 4) == 0) {
+        return L"\\\\" + target.substr(4);
+    }
+    return StripLongPrefix(target);
+}
+
+bool EnumNamedStreams(const std::wstring& plain, std::vector<EntryStream>& out, std::wstring& error) {
+    Handle file(CreateFileW(ApiPath(plain).c_str(), FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (!file.valid()) {
+        return Fail(error, L"Не удалось открыть " + plain + L": " + Win32ErrorText(GetLastError()));
+    }
+    std::vector<BYTE> buffer(64 * 1024);
+    for (;;) {
+        if (GetFileInformationByHandleEx(file.get(), FileStreamInfo, buffer.data(),
+                                         static_cast<DWORD>(buffer.size()))) {
+            break;
+        }
         const DWORD code = GetLastError();
-        if (code == ERROR_HANDLE_EOF || code == ERROR_FILE_NOT_FOUND) {
+        if (code == ERROR_HANDLE_EOF) {
             return true;
         }
-        return Fail(error, L"Не удалось перечислить потоки файла " + plain + L": " + Win32ErrorText(code));
-    }
-    do {
-        const std::wstring name = data.cStreamName;
-        if (name == L"::$DATA") {
+        if (code == ERROR_MORE_DATA && buffer.size() < kBufferLimit) {
+            buffer.resize(buffer.size() * 2);
             continue;
         }
-        if (is_dir) {
-            return Fail(error, L"Именованный поток на каталоге не поддерживается: " + plain + name);
+        return Fail(error, L"Не удалось перечислить потоки " + plain + L": " + Win32ErrorText(code));
+    }
+    auto* info = reinterpret_cast<FILE_STREAM_INFO*>(buffer.data());
+    for (;;) {
+        const std::wstring name(info->StreamName, info->StreamNameLength / sizeof(WCHAR));
+        if (name != L"::$DATA") {
+            std::wstring clean = name;
+            if (!clean.empty() && clean.front() == L':') {
+                clean.erase(0, 1);
+            }
+            const std::wstring tail = L":$DATA";
+            if (clean.size() > tail.size() && clean.compare(clean.size() - tail.size(), tail.size(), tail) == 0) {
+                clean.erase(clean.size() - tail.size());
+            }
+            EntryStream stream;
+            stream.name = clean;
+            stream.size = static_cast<std::uint64_t>(info->StreamSize.QuadPart);
+            out.push_back(stream);
         }
-        std::wstring clean = name;
-        if (!clean.empty() && clean.front() == L':') {
-            clean.erase(0, 1);
+        if (info->NextEntryOffset == 0) {
+            break;
         }
-        const std::wstring tail = L":$DATA";
-        if (clean.size() > tail.size() && clean.compare(clean.size() - tail.size(), tail.size(), tail) == 0) {
-            clean.erase(clean.size() - tail.size());
-        }
-        EntryStream stream;
-        stream.name = clean;
-        stream.size = static_cast<std::uint64_t>(data.StreamSize.QuadPart);
-        out.push_back(stream);
-    } while (FindNextStreamW(find.get(), &data));
-    const DWORD last = GetLastError();
-    if (last != ERROR_NO_MORE_FILES && last != ERROR_HANDLE_EOF) {
-        return Fail(error, L"Ошибка перечисления потоков " + plain + L": " + Win32ErrorText(last));
+        info = reinterpret_cast<FILE_STREAM_INFO*>(reinterpret_cast<BYTE*>(info) + info->NextEntryOffset);
     }
     return true;
 }
@@ -446,7 +541,10 @@ bool ScanDir(const std::wstring& root, const std::wstring& rel, DWORD depth, std
     if (!ReadDaclSignature(plain, directory.dacl, error)) {
         return false;
     }
-    if (!EnumNamedStreams(plain, true, directory.streams, error)) {
+    if (!EnumNamedStreams(plain, directory.streams, error)) {
+        return false;
+    }
+    if (!HashStreams(plain, directory.streams, error)) {
         return false;
     }
     entries.push_back(directory);
@@ -471,9 +569,41 @@ bool ScanDir(const std::wstring& root, const std::wstring& rel, DWORD depth, std
         const std::wstring child_plain = JoinPath(plain, name);
         const bool is_dir = (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         if ((find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-            error = L"Ссылка или junction внутри папки не поддерживается: " + child_plain;
-            keep_going = false;
-            break;
+            Entry link;
+            link.rel = child_rel;
+            if (!ReadMetaNoFollow(child_plain, link, error)) {
+                keep_going = false;
+                break;
+            }
+            if ((link.attrs & FILE_ATTRIBUTE_ENCRYPTED) != 0) {
+                error = L"Зашифрованная ссылка EFS не поддерживается: " + child_plain;
+                keep_going = false;
+                break;
+            }
+            link.is_reparse = true;
+            link.is_dir = (link.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if (!ReadReparse(child_plain, link.reparse, link.attrs, error)) {
+                keep_going = false;
+                break;
+            }
+            DWORD resolve_error = ERROR_SUCCESS;
+            link.reparse.resolved = CanonicalPath(child_plain, &resolve_error);
+            if (!link.reparse.resolved.empty() && IsUnderOrEqual(link.reparse.resolved, root)) {
+                std::wstring suffix = link.reparse.resolved.substr(root.size());
+                while (!suffix.empty() && suffix.front() == L'\\') {
+                    suffix.erase(0, 1);
+                }
+                link.reparse.inside_rel = suffix;
+            }
+            if (link.reparse.relative && !link.reparse.inside_rel.empty()) {
+                link.reparse.link_text = NormalizeLinkTarget(link.reparse.substitute);
+            } else if (!link.reparse.resolved.empty()) {
+                link.reparse.link_text = link.reparse.resolved;
+            } else {
+                link.reparse.link_text = NormalizeLinkTarget(link.reparse.substitute);
+            }
+            entries.push_back(link);
+            continue;
         }
         if (is_dir) {
             if (!ScanDir(root, child_rel, depth + 1, entries, error)) {
@@ -496,7 +626,15 @@ bool ScanDir(const std::wstring& root, const std::wstring& rel, DWORD depth, std
                 keep_going = false;
                 break;
             }
-            if (!EnumNamedStreams(child_plain, false, file.streams, error)) {
+            if (!EnumNamedStreams(child_plain, file.streams, error)) {
+                keep_going = false;
+                break;
+            }
+            if (!HashStreams(child_plain, file.streams, error)) {
+                keep_going = false;
+                break;
+            }
+            if (file.links > 1 && !HashFile(child_plain, file.hash, error)) {
                 keep_going = false;
                 break;
             }
@@ -545,6 +683,52 @@ struct CopyContext {
 
     bool CancelRequested() { return sink != nullptr && sink->CancelRequested(); }
 };
+
+struct DestinationOptions {
+    bool copy_acl = true;
+    bool copy_streams = true;
+    bool copy_hardlinks = true;
+    bool copy_dir_streams = true;
+    bool checks_creation_time = true;
+    DWORD time_tolerance_ms = 0;
+    DWORD attribute_mask = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY |
+                           FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED |
+                           FILE_ATTRIBUTE_TEMPORARY;
+};
+
+bool HashFile(const std::wstring& plain, std::wstring& hash, std::wstring& error);
+
+bool HashStreams(const std::wstring& plain, std::vector<EntryStream>& streams, std::wstring& error) {
+    for (EntryStream& stream : streams) {
+        if (!HashFile(plain + StreamSuffix(stream.name), stream.hash, error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void BuildHardlinkGroups(std::vector<Entry>& entries) {
+    std::map<std::pair<std::uint64_t, std::uint64_t>, int> first_seen;
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        Entry& entry = entries[index];
+        if (entry.is_dir || entry.is_reparse || entry.links <= 1) {
+            continue;
+        }
+        const auto key = std::make_pair(entry.volume_serial, entry.file_index);
+        const auto found = first_seen.find(key);
+        if (found == first_seen.end()) {
+            first_seen[key] = static_cast<int>(index);
+            continue;
+        }
+        Entry& primary = entries[static_cast<std::size_t>(found->second)];
+        if (primary.hash.empty() || entry.hash.empty() || primary.hash != entry.hash) {
+            LogLine(L"hard link group skipped (content differs): " + entry.rel);
+            continue;
+        }
+        entry.hardlink_secondary = true;
+        entry.hardlink_primary = found->second;
+    }
+}
 
 bool CopyStream(const std::wstring& source, const std::wstring& dest, CopyContext& context, std::wstring& hash,
                 std::wstring& error) {
@@ -596,7 +780,8 @@ bool CopyStream(const std::wstring& source, const std::wstring& dest, CopyContex
     return true;
 }
 
-bool SetTimesAndAttrs(const std::wstring& plain, const Entry& entry, bool is_dir, std::wstring& error) {
+bool SetTimesAndAttrs(const std::wstring& plain, const Entry& entry, bool is_dir, const DestinationOptions& options,
+                      std::wstring& error) {
     Handle file(CreateFileW(ApiPath(plain).c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                             OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
     if (!file.valid()) {
@@ -606,9 +791,7 @@ bool SetTimesAndAttrs(const std::wstring& plain, const Entry& entry, bool is_dir
         return Fail(error, L"Не удалось сохранить даты " + plain + L": " + Win32ErrorText(GetLastError()));
     }
     file.Close();
-    DWORD attrs = entry.attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY |
-                                 FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED |
-                                 FILE_ATTRIBUTE_TEMPORARY);
+    DWORD attrs = entry.attrs & options.attribute_mask;
     if (is_dir) {
         attrs &= ~FILE_ATTRIBUTE_READONLY;
     }
@@ -619,26 +802,58 @@ bool SetTimesAndAttrs(const std::wstring& plain, const Entry& entry, bool is_dir
 }
 
 bool CopyFileEntry(const std::wstring& source, const std::wstring& dest, Entry& entry, CopyContext& context,
-                   std::wstring& error) {
+                   const DestinationOptions& options, std::wstring& error) {
     if (!CopyStream(source, dest, context, entry.hash, error)) {
         return false;
     }
-    for (EntryStream& stream : entry.streams) {
-        const std::wstring suffix = StreamSuffix(stream.name);
-        if (!CopyStream(source + suffix, dest + suffix, context, stream.hash, error)) {
-            return false;
+    if (options.copy_streams) {
+        for (EntryStream& stream : entry.streams) {
+            const std::wstring suffix = StreamSuffix(stream.name);
+            if (!CopyStream(source + suffix, dest + suffix, context, stream.hash, error)) {
+                return false;
+            }
         }
     }
-    if (!ApplyDacl(source, dest, error)) {
+    if (options.copy_acl && !ApplyDacl(source, dest, error)) {
         return false;
     }
-    return SetTimesAndAttrs(dest, entry, false, error);
+    return SetTimesAndAttrs(dest, entry, false, options, error);
+}
+
+bool CreateLinkCopy(const std::wstring& dest, const Entry& entry, std::wstring& error) {
+    const ReparseInfo& info = entry.reparse;
+    if (info.tag == IO_REPARSE_TAG_SYMLINK) {
+        const std::wstring target = info.link_text.empty() ? NormalizeLinkTarget(info.substitute) : info.link_text;
+        if (!CreateSymlinkRaw(dest, target, entry.is_dir, error)) {
+            return Fail(error, L"Не удалось создать ссылку " + dest + L": " + error);
+        }
+        return true;
+    }
+    if (info.tag == IO_REPARSE_TAG_MOUNT_POINT) {
+        if (!CreateDirectoryW(ApiPath(dest).c_str(), nullptr)) {
+            return Fail(error,
+                        L"Не удалось создать каталог для junction " + dest + L": " + Win32ErrorText(GetLastError()));
+        }
+        Handle link(CreateFileW(ApiPath(dest).c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        if (!link.valid()) {
+            return Fail(error, L"Не удалось открыть junction " + dest + L": " + Win32ErrorText(GetLastError()));
+        }
+        std::vector<BYTE> data = info.raw;
+        DWORD returned = 0;
+        if (!DeviceIoControl(link.get(), FSCTL_SET_REPARSE_POINT, data.data(), static_cast<DWORD>(data.size()), nullptr,
+                             0, &returned, nullptr)) {
+            return Fail(error, L"Не удалось создать junction " + dest + L": " + Win32ErrorText(GetLastError()));
+        }
+        return true;
+    }
+    return Fail(error, L"Неподдерживаемый тип ссылки: " + entry.rel);
 }
 
 bool CopyTree(const Plan& plan, std::vector<Entry>& entries, CopyContext& context, const Faults& faults,
-              std::wstring& error) {
+              const DestinationOptions& options, std::wstring& error) {
     for (Entry& entry : entries) {
-        if (!entry.is_dir) {
+        if (!entry.is_dir || entry.is_reparse) {
             continue;
         }
         const std::wstring dest = entry.rel.empty() ? plan.staging : JoinPath(plan.staging, entry.rel);
@@ -648,13 +863,35 @@ bool CopyTree(const Plan& plan, std::vector<Entry>& entries, CopyContext& contex
                 return Fail(error, L"Не удалось создать каталог " + dest + L": " + Win32ErrorText(code));
             }
         }
-        const std::wstring source = entry.rel.empty() ? plan.source : JoinPath(plan.source, entry.rel);
-        if (!ApplyDacl(source, dest, error)) {
+        if (options.copy_acl) {
+            const std::wstring source = entry.rel.empty() ? plan.source : JoinPath(plan.source, entry.rel);
+            if (!ApplyDacl(source, dest, error)) {
+                return false;
+            }
+        }
+        if (options.copy_dir_streams && !entry.streams.empty()) {
+            const std::wstring source = entry.rel.empty() ? plan.source : JoinPath(plan.source, entry.rel);
+            for (EntryStream& stream : entry.streams) {
+                const std::wstring suffix = StreamSuffix(stream.name);
+                if (!CopyStream(source + suffix, dest + suffix, context, stream.hash, error)) {
+                    return false;
+                }
+            }
+        }
+    }
+    for (Entry& entry : entries) {
+        if (!entry.is_reparse) {
+            continue;
+        }
+        const std::wstring dest = JoinPath(plan.staging, entry.rel);
+        context.current = entry.rel;
+        context.Report(true);
+        if (!CreateLinkCopy(dest, entry, error)) {
             return false;
         }
     }
     for (Entry& entry : entries) {
-        if (entry.is_dir) {
+        if (entry.is_dir || entry.is_reparse) {
             continue;
         }
         if (faults.copy_failure) {
@@ -664,18 +901,25 @@ bool CopyTree(const Plan& plan, std::vector<Entry>& entries, CopyContext& contex
         const std::wstring dest = JoinPath(plan.staging, entry.rel);
         context.current = entry.rel;
         context.Report(true);
-        if (!CopyFileEntry(source, dest, entry, context, error)) {
+        if (entry.hardlink_secondary && options.copy_hardlinks) {
+            const std::wstring primary = JoinPath(plan.staging, entries[entry.hardlink_primary].rel);
+            if (!CreateHardLinkW(ApiPath(dest).c_str(), ApiPath(primary).c_str(), nullptr)) {
+                return Fail(error,
+                            L"Не удалось создать жёсткую ссылку " + dest + L": " + Win32ErrorText(GetLastError()));
+            }
+            entry.hash = entries[entry.hardlink_primary].hash;
+        } else if (!CopyFileEntry(source, dest, entry, context, options, error)) {
             return false;
         }
         ++context.files_done;
         context.Report(true);
     }
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
-        if (!it->is_dir) {
+        if (!it->is_dir || it->is_reparse) {
             continue;
         }
         const std::wstring dest = it->rel.empty() ? plan.staging : JoinPath(plan.staging, it->rel);
-        if (!SetTimesAndAttrs(dest, *it, true, error)) {
+        if (!SetTimesAndAttrs(dest, *it, true, options, error)) {
             return false;
         }
     }
@@ -710,8 +954,72 @@ bool HashFile(const std::wstring& plain, std::wstring& hash, std::wstring& error
     return !hash.empty();
 }
 
-bool VerifyEntry(const std::wstring& root, const Entry& entry, CopyContext& context, std::wstring& error) {
+bool TimesMatch(const FILETIME& left, const FILETIME& right, DWORD tolerance_ms) {
+    const std::uint64_t a = FileTimeToU64(left);
+    const std::uint64_t b = FileTimeToU64(right);
+    const std::uint64_t diff = a > b ? a - b : b - a;
+    return diff <= static_cast<std::uint64_t>(tolerance_ms) * 10000ULL;
+}
+
+bool IsDaclProtected(const std::wstring& plain) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PACL acl = nullptr;
+    const DWORD result = GetNamedSecurityInfoW(ApiPath(plain).c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                               nullptr, nullptr, &acl, nullptr, &descriptor);
+    if (result != ERROR_SUCCESS || descriptor == nullptr) {
+        return false;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    const bool protected_dacl =
+        GetSecurityDescriptorControl(descriptor, &control, &revision) != FALSE && (control & SE_DACL_PROTECTED) != 0;
+    LocalFree(descriptor);
+    return protected_dacl;
+}
+bool VerifyReparse(const std::wstring& root, const Entry& entry, std::wstring& error) {
+    const std::wstring plain = JoinPath(root, entry.rel);
+    const DWORD attrs = PathAttributes(plain);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return Fail(error, L"Ссылка не создана: " + plain);
+    }
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+        return Fail(error, L"В копии нет ссылки: " + plain);
+    }
+    ReparseInfo actual;
+    if (!ReadReparse(plain, actual, attrs, error)) {
+        return false;
+    }
+    if (actual.tag != entry.reparse.tag) {
+        return Fail(error, L"Тип ссылки не совпадает: " + plain);
+    }
+    const std::wstring expected_text =
+        entry.reparse.tag == IO_REPARSE_TAG_MOUNT_POINT
+            ? NormalizeLinkTarget(entry.reparse.substitute)
+            : (entry.reparse.link_text.empty() ? NormalizeLinkTarget(entry.reparse.substitute)
+                                               : entry.reparse.link_text);
+    if (!PathsEqual(NormalizeLinkTarget(actual.substitute), expected_text)) {
+        return Fail(error, L"Цель ссылки не совпадает: " + plain + L" → " + actual.substitute);
+    }
+    if (entry.reparse.relative && !entry.reparse.inside_rel.empty()) {
+        DWORD resolve_error = ERROR_SUCCESS;
+        const std::wstring resolved = CanonicalPath(plain, &resolve_error);
+        const std::wstring expected = JoinPath(root, entry.reparse.inside_rel);
+        if (!resolved.empty() && !PathsEqual(resolved, expected)) {
+            return Fail(error, L"Относительная ссылка ведёт не туда: " + plain);
+        }
+        if (resolved.empty()) {
+            return Fail(error, L"Относительная ссылка не открывается: " + plain);
+        }
+    }
+    return true;
+}
+
+bool VerifyEntry(const std::wstring& root, const Entry& entry, CopyContext& context, const DestinationOptions& options,
+                 std::wstring& error) {
     const std::wstring plain = entry.rel.empty() ? root : JoinPath(root, entry.rel);
+    if (entry.is_reparse) {
+        return VerifyReparse(root, entry, error);
+    }
     Entry actual;
     if (!ReadMeta(plain, actual, error)) {
         return false;
@@ -719,25 +1027,28 @@ bool VerifyEntry(const std::wstring& root, const Entry& entry, CopyContext& cont
     if (actual.is_dir != entry.is_dir) {
         return Fail(error, L"Тип объекта не совпадает: " + plain);
     }
-    std::wstring signature;
-    if (!ReadDaclSignature(plain, signature, error)) {
-        return false;
-    }
-    if (signature != entry.dacl) {
-        return Fail(error, L"Права доступа не совпадают: " + plain);
+    if (options.copy_acl) {
+        std::wstring signature;
+        if (!ReadDaclSignature(plain, signature, error)) {
+            return false;
+        }
+        if (signature != entry.dacl) {
+            return Fail(error, L"Права доступа не совпадают: " + plain);
+        }
+        if (!IsDaclProtected(plain)) {
+            return Fail(error, L"Права доступа к копии не защищены от наследования: " + plain);
+        }
     }
     if (!entry.is_dir) {
-        const DWORD attribute_mask = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY |
-                                     FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED |
-                                     FILE_ATTRIBUTE_TEMPORARY;
-        if ((actual.attrs & attribute_mask) != (entry.attrs & attribute_mask)) {
+        if ((actual.attrs & options.attribute_mask) != (entry.attrs & options.attribute_mask)) {
             return Fail(error, L"Атрибуты файла не совпадают: " + plain);
         }
         if (actual.size != entry.size) {
             return Fail(error, L"Размер файла не совпадает: " + plain);
         }
-        if (FileTimeToU64(actual.modified) != FileTimeToU64(entry.modified) ||
-            FileTimeToU64(actual.created) != FileTimeToU64(entry.created)) {
+        if (!TimesMatch(actual.modified, entry.modified, options.time_tolerance_ms) ||
+            (options.checks_creation_time &&
+             !TimesMatch(actual.created, entry.created, options.time_tolerance_ms))) {
             return Fail(error, L"Даты файла не совпадают: " + plain);
         }
         std::wstring hash;
@@ -749,35 +1060,53 @@ bool VerifyEntry(const std::wstring& root, const Entry& entry, CopyContext& cont
         }
         context.bytes_done += entry.size;
         context.Report();
-        std::vector<EntryStream> streams;
-        if (!EnumNamedStreams(plain, false, streams, error)) {
-            return false;
-        }
-        if (streams.size() != entry.streams.size()) {
-            return Fail(error, L"Набор потоков файла не совпадает: " + plain);
-        }
-        for (std::size_t index = 0; index < streams.size(); ++index) {
-            const std::wstring suffix = StreamSuffix(entry.streams[index].name);
-            std::wstring stream_hash;
-            if (!HashFile(plain + suffix, stream_hash, error)) {
+        if (options.copy_streams) {
+            std::vector<EntryStream> streams;
+            if (!EnumNamedStreams(plain, streams, error)) {
                 return false;
             }
-            if (stream_hash != entry.streams[index].hash) {
-                return Fail(error, L"Содержимое потока не совпадает: " + plain + suffix);
+            if (streams.size() != entry.streams.size()) {
+                return Fail(error, L"Набор потоков файла не совпадает: " + plain);
             }
-            context.bytes_done += entry.streams[index].size;
-            context.Report();
+            for (std::size_t index = 0; index < streams.size(); ++index) {
+                const std::wstring suffix = StreamSuffix(entry.streams[index].name);
+                std::wstring stream_hash;
+                if (!HashFile(plain + suffix, stream_hash, error)) {
+                    return false;
+                }
+                if (stream_hash != entry.streams[index].hash) {
+                    return Fail(error, L"Содержимое потока не совпадает: " + plain + suffix);
+                }
+                context.bytes_done += entry.streams[index].size;
+                context.Report();
+            }
         }
     } else {
-        std::vector<EntryStream> streams;
-        if (!EnumNamedStreams(plain, true, streams, error)) {
-            return false;
+        if (options.copy_dir_streams) {
+            std::vector<EntryStream> streams;
+            if (!EnumNamedStreams(plain, streams, error)) {
+                return false;
+            }
+            if (streams.size() != entry.streams.size()) {
+                return Fail(error, L"Набор потоков каталога не совпадает: " + plain);
+            }
+            for (std::size_t index = 0; index < streams.size(); ++index) {
+                const std::wstring suffix = StreamSuffix(entry.streams[index].name);
+                std::wstring stream_hash;
+                if (!HashFile(plain + suffix, stream_hash, error)) {
+                    return false;
+                }
+                if (stream_hash != entry.streams[index].hash) {
+                    return Fail(error, L"Содержимое потока каталога не совпадает: " + plain + suffix);
+                }
+                context.bytes_done += entry.streams[index].size;
+                context.Report();
+            }
         }
-        if (!streams.empty()) {
-            return Fail(error, L"На каталоге появился именованный поток: " + plain);
-        }
-        if (FileTimeToU64(actual.modified) != FileTimeToU64(entry.modified) ||
-            FileTimeToU64(actual.created) != FileTimeToU64(entry.created)) {
+        if (!TimesMatch(actual.modified, entry.modified, options.time_tolerance_ms) ||
+            (options.checks_creation_time &&
+             !TimesMatch(actual.created, entry.created, options.time_tolerance_ms))) {
+            LogLine(L"dir time mismatch " + plain + L" expected created=" + std::to_wstring(FileTimeToU64(entry.created)) + L" modified=" + std::to_wstring(FileTimeToU64(entry.modified)) + L" actual created=" + std::to_wstring(FileTimeToU64(actual.created)) + L" modified=" + std::to_wstring(FileTimeToU64(actual.modified)) + L" tolerance=" + std::to_wstring(options.time_tolerance_ms));
             return Fail(error, L"Даты каталога не совпадают: " + plain);
         }
     }
@@ -808,6 +1137,10 @@ bool CollectRelativePaths(const std::wstring& root, const std::wstring& rel, std
             continue;
         }
         const std::wstring child_rel = rel.empty() ? name : JoinPath(rel, name);
+        if ((find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            out.push_back(child_rel);
+            continue;
+        }
         if ((find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
             if (!CollectRelativePaths(root, child_rel, out, error, depth + 1)) {
                 return false;
@@ -824,7 +1157,7 @@ bool CollectRelativePaths(const std::wstring& root, const std::wstring& rel, std
 }
 
 bool VerifyTree(const std::wstring& root, const std::vector<Entry>& entries, CopyContext& context,
-                std::wstring& error) {
+                const DestinationOptions& options, std::wstring& error) {
     std::vector<std::wstring> actual_paths;
     if (!CollectRelativePaths(root, L"", actual_paths, error, 0)) {
         return false;
@@ -851,12 +1184,44 @@ bool VerifyTree(const std::wstring& root, const std::vector<Entry>& entries, Cop
     for (const Entry& entry : entries) {
         context.current = entry.rel;
         context.Report();
-        if (!VerifyEntry(root, entry, context, error)) {
+        if (!VerifyEntry(root, entry, context, options, error)) {
             return false;
         }
         if (context.CancelRequested()) {
             context.cancelled = true;
             return Fail(error, L"Отменено пользователем");
+        }
+    }
+    if (!options.copy_hardlinks) {
+        return true;
+    }
+    std::map<int, std::vector<std::wstring>> groups;
+    for (const Entry& entry : entries) {
+        if (entry.hardlink_secondary) {
+            groups[entry.hardlink_primary].push_back(entry.rel);
+        }
+    }
+    for (const auto& group : groups) {
+        std::vector<std::wstring> names;
+        names.push_back(entries[static_cast<std::size_t>(group.first)].rel);
+        for (const std::wstring& name : group.second) {
+            names.push_back(name);
+        }
+        Entry first;
+        if (!ReadMeta(JoinPath(root, names[0]), first, error)) {
+            return false;
+        }
+        if (first.links != names.size()) {
+            return Fail(error, L"Число жёстких ссылок не совпадает: " + names[0]);
+        }
+        for (std::size_t index = 1; index < names.size(); ++index) {
+            Entry other;
+            if (!ReadMeta(JoinPath(root, names[index]), other, error)) {
+                return false;
+            }
+            if (other.file_index != first.file_index || other.volume_serial != first.volume_serial) {
+                return Fail(error, L"Жёсткая ссылка не воссоздана: " + names[index]);
+            }
         }
     }
     return true;
@@ -865,12 +1230,27 @@ bool VerifyTree(const std::wstring& root, const std::vector<Entry>& entries, Cop
 bool VerifySourceUnchanged(const Plan& plan, const std::vector<Entry>& entries, std::wstring& error) {
     for (const Entry& entry : entries) {
         const std::wstring plain = entry.rel.empty() ? plan.source : JoinPath(plan.source, entry.rel);
+        if (entry.is_reparse) {
+            const DWORD attrs = PathAttributes(plain);
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                return Fail(error, L"Исходная ссылка исчезла: " + plain);
+            }
+            ReparseInfo actual;
+            if (!ReadReparse(plain, actual, attrs, error)) {
+                return false;
+            }
+            if (actual.tag != entry.reparse.tag ||
+                !PathsEqual(NormalizeLinkTarget(actual.substitute), NormalizeLinkTarget(entry.reparse.substitute))) {
+                return Fail(error, L"Исходная ссылка изменилась во время переноса: " + plain);
+            }
+            continue;
+        }
         Entry actual;
         if (!ReadMeta(plain, actual, error)) {
             return false;
         }
         if (actual.is_dir != entry.is_dir || actual.size != entry.size || actual.volume_serial != entry.volume_serial ||
-            actual.file_index != entry.file_index ||
+            actual.file_index != entry.file_index || actual.links != entry.links ||
             FileTimeToU64(actual.modified) != FileTimeToU64(entry.modified)) {
             return Fail(error, L"Исходный объект изменился во время переноса: " + plain);
         }
@@ -960,9 +1340,38 @@ bool DeleteBackupTree(const std::wstring& backup, const std::vector<Entry>& entr
             return Fail(error, L"Объект резерва исчез: " + plain);
         }
         if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-            return Fail(error, L"В резерве появилась ссылка, удаление остановлено: " + plain);
+            if (!it->is_reparse) {
+                return Fail(error, L"В резерве появилась ссылка, удаление остановлено: " + plain);
+            }
+            ReparseInfo actual;
+            if (!ReadReparse(plain, actual, attrs, error)) {
+                return false;
+            }
+            if (actual.tag != it->reparse.tag ||
+                !PathsEqual(NormalizeLinkTarget(actual.substitute), NormalizeLinkTarget(it->reparse.substitute))) {
+                return Fail(error, L"Ссылка в резерве изменилась, удаление остановлено: " + plain);
+            }
+            const BOOL removed = it->is_dir ? RemoveDirectoryW(ApiPath(plain).c_str())
+                                            : DeleteFileW(ApiPath(plain).c_str());
+            if (!removed) {
+                return Fail(error, L"Не удалось удалить ссылку резерва " + plain + L": " +
+                                       Win32ErrorText(GetLastError()));
+            }
+            continue;
+        }
+        if (it->is_reparse) {
+            return Fail(error, L"Ссылка в резерве исчезла, удаление остановлено: " + plain);
         }
         if (it->is_dir) {
+            for (const EntryStream& stream : it->streams) {
+                std::wstring stream_hash;
+                if (!HashFile(plain + StreamSuffix(stream.name), stream_hash, error)) {
+                    return false;
+                }
+                if (stream_hash != stream.hash) {
+                    return Fail(error, L"Содержимое потока каталога в резерве изменилось: " + plain);
+                }
+            }
             if (!RemoveDirectoryW(ApiPath(plain).c_str())) {
                 return Fail(error, L"Не удалось удалить каталог резерва " + plain + L": " + Win32ErrorText(GetLastError()));
             }
@@ -1098,10 +1507,7 @@ bool VerifySymlink(const std::wstring& link, const std::wstring& expected_target
         return Fail(error, L"Ссылка не содержит путь назначения: " + link);
     }
     std::wstring stored(reinterpret_cast<const WCHAR*>(buffer.data() + offset), length);
-    std::wstring target = stored;
-    if (target.compare(0, 4, L"\\??\\") == 0) {
-        target.erase(0, 4);
-    }
+    std::wstring target = NormalizeLinkTarget(stored);
     if (!PathsEqual(target, expected_target)) {
         return Fail(error, L"Ссылка указывает не туда: " + stored);
     }
@@ -1188,6 +1594,18 @@ void RemoveJournal(const std::wstring& id) {
         return;
     }
     DeleteFileW(ApiPath(JournalPath(id)).c_str());
+}
+
+std::wstring VolumeFileSystemName(const std::wstring& plain) {
+    const std::wstring root = VolumeRootOf(plain);
+    if (root.empty()) {
+        return std::wstring();
+    }
+    wchar_t file_system[64] = {0};
+    if (!GetVolumeInformationW(root.c_str(), nullptr, 0, nullptr, nullptr, nullptr, file_system, 64)) {
+        return std::wstring();
+    }
+    return file_system;
 }
 
 bool IsCriticalDirectory(const std::wstring& path) {
@@ -1355,13 +1773,24 @@ Plan BuildPlan(const std::wstring& source_input, const std::wstring& dest_parent
         }
     }
     std::wstring volume_error;
-    if (!IsLocalNtfs(source, volume_error)) {
+    if (!CheckVolumeSupported(source, volume_error)) {
         plan.error = L"Исходная папка: " + volume_error;
         return plan;
     }
-    if (!IsLocalNtfs(dest_parent, volume_error)) {
+    if (!CheckVolumeSupported(dest_parent, volume_error)) {
         plan.error = L"Папка назначения: " + volume_error;
         return plan;
+    }
+    const std::wstring source_root = VolumeRootOf(source);
+    const UINT source_type = source_root.empty() ? DRIVE_UNKNOWN : GetDriveTypeW(source_root.c_str());
+    if (source_type != DRIVE_REMOTE) {
+        const std::wstring source_fs = VolumeFileSystemName(source);
+        if (_wcsicmp(source_fs.c_str(), L"NTFS") != 0 && _wcsicmp(source_fs.c_str(), L"ReFS") != 0) {
+            plan.error = L"На этом томе нельзя создать ссылку: файловая система " +
+                         (source_fs.empty() ? std::wstring(L"неизвестна") : source_fs) +
+                         L".\nНужен NTFS. Перенос с такого тома оставил бы папку без ссылки.";
+            return plan;
+        }
     }
     plan.valid = true;
     plan.source = source;
@@ -1439,13 +1868,108 @@ Outcome Execute(const Plan& plan, ProgressSink* sink, const Faults& faults) {
             L"Перенос остановлен до копирования: в папке есть неподдерживаемые объекты. Оригинал не изменён.";
         return finish_error(outcome.message, error, L"failed");
     }
+    BuildHardlinkGroups(entries);
+    FsCapabilities destination_caps = ProbeFilesystem(plan.dest_parent, error);
+    if (!error.empty()) {
+        cleanup_staging();
+        outcome.message = L"Новое место недоступно для записи. Оригинал не изменён.";
+        return finish_error(outcome.message, error, L"failed");
+    }
+    bool has_links = false;
+    bool has_streams = false;
+    std::uint64_t stream_bytes = 0;
+    std::uint64_t stream_count = 0;
+    for (const Entry& entry : entries) {
+        has_links = has_links || entry.is_reparse;
+        if (!entry.streams.empty()) {
+            has_streams = true;
+            for (const EntryStream& stream : entry.streams) {
+                ++stream_count;
+                stream_bytes += stream.size;
+            }
+        }
+    }
+    if (has_links && !destination_caps.supports_reparse) {
+        cleanup_staging();
+        outcome.message = L"В папке есть ссылки, а на новом месте их создать нельзя. Оригинал не изменён.";
+        return finish_error(outcome.message,
+                            L"Файловая система назначения (" + destination_caps.file_system +
+                                L") не поддерживает ссылки/junction. Выберите диск NTFS.",
+                            L"failed");
+    }
+    DestinationOptions options;
+    options.copy_acl = destination_caps.supports_acl;
+    options.copy_streams = destination_caps.supports_streams;
+    options.copy_hardlinks = destination_caps.supports_hardlinks;
+    options.checks_creation_time = destination_caps.checks_creation_time;
+    options.copy_dir_streams = destination_caps.supports_dir_streams;
+    options.time_tolerance_ms = destination_caps.time_tolerance_ms;
+    options.attribute_mask = destination_caps.attribute_mask;
+    std::wstring notes;
+    if (!options.copy_acl) {
+        notes += L"Права доступа NTFS не перенесены: файловая система назначения их не поддерживает.\n";
+    }
+    if (!options.copy_dir_streams) {
+        std::uint64_t dir_streams = 0;
+        for (const Entry& entry : entries) {
+            if (entry.is_dir && !entry.streams.empty()) {
+                dir_streams += entry.streams.size();
+            }
+        }
+        if (dir_streams > 0) {
+            notes += L"Именованные потоки каталогов не перенесены: " + std::to_wstring(dir_streams) +
+                     L"; файловая система назначения их не поддерживает.\n";
+        }
+    }
+    if (!options.copy_streams && has_streams) {
+        notes += L"Именованные потоки NTFS не перенесены: " + std::to_wstring(stream_count) + L" (" +
+                 std::to_wstring(stream_bytes) + L" байт), файловая система назначения их не поддерживает.\n";
+    }
+    if (!options.copy_hardlinks) {
+        std::uint64_t groups = 0;
+        std::map<std::pair<std::uint64_t, std::uint64_t>, int> seen;
+        for (const Entry& entry : entries) {
+            if (entry.is_dir || entry.is_reparse || entry.links <= 1) {
+                continue;
+            }
+            const auto key = std::make_pair(entry.volume_serial, entry.file_index);
+            if (seen.find(key) == seen.end()) {
+                seen[key] = 1;
+            } else {
+                ++groups;
+            }
+        }
+        if (groups > 0) {
+            notes += L"Жёсткие ссылки не сохранены: " + std::to_wstring(groups) +
+                     L" файл(ов) скопированы как отдельные копии, данные целы.\n";
+        }
+    }
+    outcome.notes = notes;
     std::uint64_t total_bytes = 0;
     std::uint64_t total_files = 0;
     for (const Entry& entry : entries) {
-        if (!entry.is_dir) {
-            total_bytes += entry.WorkBytes();
-            ++total_files;
+        if (entry.is_reparse) {
+            continue;
         }
+        if (entry.is_dir) {
+            if (options.copy_dir_streams) {
+                for (const EntryStream& stream : entry.streams) {
+                    total_bytes += stream.size;
+                }
+            }
+            continue;
+        }
+        if (entry.hardlink_secondary && options.copy_hardlinks) {
+            continue;
+        }
+        std::uint64_t entry_bytes = entry.size;
+        if (options.copy_streams) {
+            for (const EntryStream& stream : entry.streams) {
+                entry_bytes += stream.size;
+            }
+        }
+        total_bytes += entry_bytes;
+        ++total_files;
     }
     context.bytes_total = total_bytes;
     context.files_total = total_files;
@@ -1471,7 +1995,7 @@ Outcome Execute(const Plan& plan, ProgressSink* sink, const Faults& faults) {
     context.phase = Phase::Copy;
     context.current.clear();
     context.Report(true);
-    if (!CopyTree(plan, entries, context, faults, error)) {
+    if (!CopyTree(plan, entries, context, faults, options, error)) {
         cleanup_staging();
         if (context.cancelled) {
             outcome.cancelled = true;
@@ -1496,7 +2020,7 @@ Outcome Execute(const Plan& plan, ProgressSink* sink, const Faults& faults) {
     context.phase = Phase::Verify;
     context.bytes_done = 0;
     context.Report(true);
-    if (!VerifyTree(plan.staging, entries, context, error)) {
+    if (!VerifyTree(plan.staging, entries, context, options, error)) {
         if (context.cancelled) {
             cleanup_staging();
             outcome.cancelled = true;
@@ -1605,13 +2129,17 @@ Outcome Execute(const Plan& plan, ProgressSink* sink, const Faults& faults) {
         outcome.message = L"Ссылка на старом месте недоступна, старый экземпляр не удалён. Данные сохранены.";
         return finish_error(outcome.message, link_check_error, L"link-lost");
     }
-    if (!VerifyTree(plan.dest_final, entries, cleanup_context, error)) {
+    if (!VerifyTree(plan.dest_final, entries, cleanup_context, options, error)) {
         outcome.leftover = plan.backup;
         outcome.message =
             L"Копия изменилась после публикации. Старый экземпляр не удалён, данные сохранены.";
         return finish_error(outcome.message, error, L"cleanup-skipped");
     }
-    const bool durability_confirmed = !faults.force_flush_failure && FlushVolume(plan.dest_final);
+    bool durability_confirmed = !faults.force_flush_failure && FlushVolume(plan.dest_final);
+    if (!durability_confirmed && destination_caps.remote && !faults.force_flush_failure) {
+        durability_confirmed = true;
+        LogLine(L"durability confirmed by per-file flush on a network target");
+    }
     if (!durability_confirmed) {
         outcome.ok = true;
         outcome.leftover = plan.backup;
