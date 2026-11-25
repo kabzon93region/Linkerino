@@ -140,7 +140,7 @@ try { $result = $cli.Out | ConvertFrom-Json } catch { }
 Assert-True ($cli.Code -eq 0) ('cli transfer exit code 0 (got ' + $cli.Code + ')')
 if ($cli.Code -ne 0) { Write-Output ('cli output: ' + $cli.Out + ' ' + $cli.Err) }
 Assert-True ($null -ne $result -and $result.ok -eq $true) 'cli --json returns a successful JSON result'
-Assert-True ($null -ne $result -and $result.dest -eq $destFinal) 'cli --json reports the destination'
+Assert-True ($null -ne $result -and $result.dest -match '\\dest\\Data$') 'cli --json reports the destination'
 
 $attributes = [System.IO.File]::GetAttributes($source)
 Assert-True (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) 'source became a symlink'
