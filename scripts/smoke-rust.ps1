@@ -2,6 +2,7 @@ param(
     [string]$Exe = 'rust\target\release\Linkerino.exe',
     [string]$Screenshot = 'docs\images\linkerino-rust-window.png',
     [string]$ResultScreenshot = 'docs\images\linkerino-rust-result.png',
+    [string]$DarkScreenshot = 'docs\images\linkerino-rust-dark.png',
     [switch]$SkipGui
 )
 
@@ -118,8 +119,9 @@ Write-Output ('INFO: transfer took ' + [math]::Round($sw.Elapsed.TotalSeconds, 2
 
 if (-not $SkipGui) {
     $shots = @(
-        @{ Path = $Screenshot; Extra = '--demo' },
-        @{ Path = $ResultScreenshot; Extra = '--demo-result' }
+        @{ Path = $Screenshot; Extra = '--demo --theme light' },
+        @{ Path = $ResultScreenshot; Extra = '--demo-result --theme light' },
+        @{ Path = $DarkScreenshot; Extra = '--demo --theme dark' }
     )
     foreach ($shot in $shots) {
         if (-not $shot.Path) { continue }
@@ -130,7 +132,9 @@ if (-not $SkipGui) {
         if (Test-Path -LiteralPath $shot.Path) { Remove-Item -LiteralPath $shot.Path -Force }
         $consoleOut = Join-Path $root ('gui-out-' + [guid]::NewGuid().ToString('N') + '.txt')
         $consoleErr = Join-Path $root ('gui-err-' + [guid]::NewGuid().ToString('N') + '.txt')
-        $gui = Start-Process -FilePath $exePath -ArgumentList '--screenshot', ('"' + $shot.Path + '"'), $shot.Extra `
+        $extraArgs = $shot.Extra.Split(' ')
+        $arguments = @('--screenshot', ('"' + $shot.Path + '"')) + $extraArgs
+        $gui = Start-Process -FilePath $exePath -ArgumentList $arguments `
             -RedirectStandardOutput $consoleOut -RedirectStandardError $consoleErr -PassThru -Wait
         $code = [string]$gui.ExitCode
         Assert-True ($code -eq '0') ('gui screenshot ' + $shot.Extra + ' exit code 0 (got ' + $code + ')')

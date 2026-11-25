@@ -25,9 +25,14 @@ fn init_journals() {
 }
 
 fn temp_root() -> PathBuf {
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     init_journals();
     let base = std::env::temp_dir();
-    let name = format!("linkerino-rs-{}", std::process::id() as u64 * 1000 + rand_suffix());
+    // Process id alone repeats for every test; the counter keeps roots unique even when the
+    // tests run in parallel (the clock alone can return the same tick for two threads).
+    let slot = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!("linkerino-rs-{}-{}-{}", std::process::id(), slot, rand_suffix());
     let path = base.join(name);
     fs::create_dir_all(&path).unwrap();
     path

@@ -8,12 +8,123 @@ use std::sync::Arc;
 use eframe::egui;
 use linkerino::engine;
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(47, 111, 237);
-const SURFACE: egui::Color32 = egui::Color32::from_rgb(255, 255, 255);
-const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(244, 246, 250);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(24, 28, 36);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(108, 115, 127);
-const DANGER: egui::Color32 = egui::Color32::from_rgb(200, 52, 52);
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    fn key(self) -> &'static str {
+        match self {
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+}
+
+fn theme_from_key(value: &str) -> Theme {
+    if value.trim().eq_ignore_ascii_case("dark") {
+        Theme::Dark
+    } else {
+        Theme::Light
+    }
+}
+
+fn parse_theme(text: &str) -> Theme {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("theme=") {
+            return theme_from_key(value);
+        }
+        if !line.contains('=') {
+            return theme_from_key(line);
+        }
+    }
+    Theme::Light
+}
+
+fn settings_path() -> Option<PathBuf> {
+    let base = std::env::var("LOCALAPPDATA").ok()?;
+    Some(std::path::Path::new(&base).join("Linkerino").join("settings.txt"))
+}
+
+fn load_theme() -> Theme {
+    let Some(path) = settings_path() else { return Theme::Light };
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_theme(&text),
+        Err(_) => Theme::Light,
+    }
+}
+
+fn save_theme(theme: Theme) {
+    let Some(path) = settings_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("theme={}\n", theme.key()));
+}
+
+struct Palette {
+    accent: egui::Color32,
+    surface: egui::Color32,
+    background: egui::Color32,
+    text: egui::Color32,
+    muted: egui::Color32,
+    danger: egui::Color32,
+    edge: egui::Color32,
+    preview: egui::Color32,
+    track: egui::Color32,
+    disabled: egui::Color32,
+    on_accent: egui::Color32,
+    on_disabled: egui::Color32,
+}
+
+impl Palette {
+    fn light() -> Self {
+        Palette {
+            accent: egui::Color32::from_rgb(47, 111, 237),
+            surface: egui::Color32::from_rgb(255, 255, 255),
+            background: egui::Color32::from_rgb(244, 246, 250),
+            text: egui::Color32::from_rgb(24, 28, 36),
+            muted: egui::Color32::from_rgb(108, 115, 127),
+            danger: egui::Color32::from_rgb(200, 52, 52),
+            edge: egui::Color32::from_rgb(228, 232, 238),
+            preview: egui::Color32::from_rgb(233, 239, 253),
+            track: egui::Color32::from_rgb(226, 231, 239),
+            disabled: egui::Color32::from_rgb(227, 231, 237),
+            on_accent: egui::Color32::WHITE,
+            on_disabled: egui::Color32::from_rgb(108, 115, 127),
+        }
+    }
+
+    fn dark() -> Self {
+        Palette {
+            accent: egui::Color32::from_rgb(107, 156, 255),
+            surface: egui::Color32::from_rgb(29, 35, 44),
+            background: egui::Color32::from_rgb(18, 22, 28),
+            text: egui::Color32::from_rgb(232, 237, 244),
+            muted: egui::Color32::from_rgb(150, 160, 175),
+            danger: egui::Color32::from_rgb(240, 115, 110),
+            edge: egui::Color32::from_rgb(48, 57, 70),
+            preview: egui::Color32::from_rgb(30, 44, 72),
+            track: egui::Color32::from_rgb(45, 54, 67),
+            disabled: egui::Color32::from_rgb(51, 60, 72),
+            on_accent: egui::Color32::from_rgb(15, 23, 37),
+            on_disabled: egui::Color32::from_rgb(168, 178, 192),
+        }
+    }
+
+    fn of(theme: Theme) -> Self {
+        match theme {
+            Theme::Light => Palette::light(),
+            Theme::Dark => Palette::dark(),
+        }
+    }
+}
 
 enum Msg {
     Progress(engine::Progress),
@@ -52,6 +163,9 @@ struct App {
     screenshot_requested: bool,
     frames: u32,
     scroll_to_result: bool,
+    theme: Theme,
+    palette: Palette,
+    theme_locked: bool,
 }
 
 /// Keeps both the beginning and the end of a long path visible.
@@ -94,6 +208,7 @@ impl App {
         demo: bool,
         demo_result: bool,
         demo_journals: bool,
+        theme_override: Option<Theme>,
     ) -> Self {
         let mut fonts = egui::FontDefinitions::default();
         if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
@@ -104,18 +219,6 @@ impl App {
         }
         cc.egui_ctx.set_fonts(fonts);
 
-        let mut visuals = egui::Visuals::light();
-        visuals.override_text_color = Some(TEXT);
-        visuals.panel_fill = BACKGROUND;
-        visuals.window_fill = SURFACE;
-        visuals.extreme_bg_color = SURFACE;
-        visuals.widgets.inactive.bg_fill = SURFACE;
-        visuals.widgets.inactive.weak_bg_fill = SURFACE;
-        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 219, 228));
-        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
-        visuals.selection.bg_fill = ACCENT.linear_multiply(0.25);
-        cc.egui_ctx.set_visuals(visuals);
-
         let mut style = (*cc.egui_ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(12.0, 7.0);
@@ -123,6 +226,9 @@ impl App {
         style.visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
         style.visuals.widgets.active.rounding = egui::Rounding::same(8.0);
         cc.egui_ctx.set_style(style);
+
+        let theme = theme_override.unwrap_or_else(load_theme);
+        let palette = Palette::of(theme);
 
         let journals: Vec<String> =
             engine::unfinished_journals().iter().map(|p| p.to_string_lossy().to_string()).collect();
@@ -144,7 +250,11 @@ impl App {
             screenshot_requested: false,
             frames: 0,
             scroll_to_result: false,
+            theme,
+            palette,
+            theme_locked: theme_override.is_some(),
         };
+        app.apply_theme(&cc.egui_ctx);
         if demo || demo_result {
             app.source = "D:\\Games\\Example".to_string();
             app.dest = "E:\\Backup".to_string();
@@ -172,6 +282,63 @@ impl App {
                 .collect();
         }
         app
+    }
+
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let palette = &self.palette;
+        let mut visuals = match self.theme {
+            Theme::Light => egui::Visuals::light(),
+            Theme::Dark => egui::Visuals::dark(),
+        };
+        visuals.override_text_color = Some(palette.text);
+        visuals.panel_fill = palette.background;
+        visuals.window_fill = palette.surface;
+        visuals.extreme_bg_color = palette.surface;
+        visuals.window_stroke = egui::Stroke::new(1.0_f32, palette.edge);
+        visuals.widgets.inactive.bg_fill = palette.surface;
+        visuals.widgets.inactive.weak_bg_fill = palette.surface;
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, palette.edge);
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, palette.text);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, palette.accent);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, palette.text);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, palette.accent);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, palette.text);
+        let open = &mut visuals.widgets.open;
+        open.bg_fill = palette.surface;
+        open.weak_bg_fill = palette.surface;
+        open.bg_stroke = egui::Stroke::new(1.0_f32, palette.edge);
+        open.fg_stroke = egui::Stroke::new(1.0_f32, palette.text);
+        visuals.selection.bg_fill = palette.accent.linear_multiply(0.3);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, palette.text);
+        ctx.set_visuals(visuals);
+    }
+
+    fn set_theme(&mut self, theme: Theme, ctx: &egui::Context) {
+        if self.theme == theme {
+            return;
+        }
+        self.theme = theme;
+        self.palette = Palette::of(theme);
+        self.apply_theme(ctx);
+        if !self.theme_locked {
+            save_theme(theme);
+        }
+    }
+
+    fn theme_switch(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut chosen = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if ui.selectable_label(self.theme == Theme::Light, "Светлая").clicked() {
+                chosen = Some(Theme::Light);
+            }
+            if ui.selectable_label(self.theme == Theme::Dark, "Тёмная").clicked() {
+                chosen = Some(Theme::Dark);
+            }
+        });
+        if let Some(theme) = chosen {
+            self.set_theme(theme, ctx);
+        }
     }
 
     fn refresh_preview(&mut self) {
@@ -248,16 +415,16 @@ impl App {
         }
     }
 
-    fn card(ui: &mut egui::Ui, title: &str, value: &mut String, browse: bool) -> bool {
+    fn card(ui: &mut egui::Ui, palette: &Palette, title: &str, value: &mut String, browse: bool) -> bool {
         let mut changed = false;
         egui::Frame::none()
-            .fill(SURFACE)
+            .fill(palette.surface)
             .rounding(egui::Rounding::same(10.0))
             .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(228, 232, 238)))
+            .stroke(egui::Stroke::new(1.0_f32, palette.edge))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(title).size(10.5).color(MUTED));
+                ui.label(egui::RichText::new(title).size(10.5).color(palette.muted));
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     let button_width = 74.0;
@@ -284,10 +451,11 @@ impl App {
     fn footer(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let can_start = !self.running && !self.preview.is_empty();
+            let start_text = if can_start { self.palette.on_accent } else { self.palette.on_disabled };
             let start = ui.add_enabled(
                 can_start,
-                egui::Button::new(egui::RichText::new("Перенести").color(egui::Color32::WHITE).strong())
-                    .fill(if can_start { ACCENT } else { egui::Color32::from_rgb(170, 178, 190) })
+                egui::Button::new(egui::RichText::new("Перенести").color(start_text).strong())
+                    .fill(if can_start { self.palette.accent } else { self.palette.disabled })
                     .rounding(egui::Rounding::same(8.0))
                     .min_size(egui::vec2(150.0, 34.0)),
             );
@@ -356,17 +524,21 @@ impl eframe::App for App {
             }
         }
 
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(BACKGROUND)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(self.palette.background)).show(ctx, |ui| {
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 ui.add_space(16.0);
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("Linkerino").size(22.0).strong().color(TEXT));
+                    ui.label(egui::RichText::new("Linkerino").size(22.0).strong().color(self.palette.text));
                     ui.label(
                         egui::RichText::new("Перенести папку и оставить на старом месте ссылку")
                             .size(12.0)
-                            .color(MUTED),
+                            .color(self.palette.muted),
                     );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(16.0);
+                    self.theme_switch(ui, ctx);
                 });
             });
             ui.add_space(12.0);
@@ -380,9 +552,9 @@ impl eframe::App for App {
                     .auto_shrink([false, false])
                     .max_height(scroll_height)
                     .show(ui, |ui| {
-                        let mut changed = App::card(ui, "ОТКУДА", &mut self.source, true);
+                        let mut changed = App::card(ui, &self.palette, "ОТКУДА", &mut self.source, true);
                         ui.add_space(6.0);
-                        changed |= App::card(ui, "КУДА", &mut self.dest, true);
+                        changed |= App::card(ui, &self.palette, "КУДА", &mut self.dest, true);
                         if changed {
                             self.refresh_preview();
                         }
@@ -390,19 +562,19 @@ impl eframe::App for App {
                         ui.add_space(10.0);
                         if !self.preview.is_empty() {
                             egui::Frame::none()
-                                .fill(egui::Color32::from_rgb(233, 239, 253))
+                                .fill(self.palette.preview)
                                 .rounding(egui::Rounding::same(8.0))
                                 .inner_margin(egui::Margin::symmetric(10.0, 6.0))
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new("Станет").size(11.0).color(MUTED));
+                                        ui.label(egui::RichText::new("Станет").size(11.0).color(self.palette.muted));
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(&self.preview)
                                                     .monospace()
                                                     .size(12.0)
-                                                    .color(ACCENT),
+                                                    .color(self.palette.accent),
                                             )
                                             .truncate(),
                                         );
@@ -410,38 +582,38 @@ impl eframe::App for App {
                                 });
                         } else if !self.preview_error.is_empty() {
                             ui.add(
-                                egui::Label::new(egui::RichText::new(&self.preview_error).size(11.5).color(DANGER))
+                                egui::Label::new(egui::RichText::new(&self.preview_error).size(11.5).color(self.palette.danger))
                                     .wrap(),
                             );
                         } else {
-                            ui.label(egui::RichText::new("Выберите обе папки").size(11.5).color(MUTED));
+                            ui.label(egui::RichText::new("Выберите обе папки").size(11.5).color(self.palette.muted));
                         }
 
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             let percent_width = 40.0;
-                            ui.visuals_mut().extreme_bg_color = egui::Color32::from_rgb(226, 231, 239);
+                            ui.visuals_mut().extreme_bg_color = self.palette.track;
                             let bar = egui::ProgressBar::new(self.percent)
                                 .desired_width((ui.available_width() - percent_width).max(80.0))
                                 .desired_height(6.0)
-                                .fill(ACCENT)
+                                .fill(self.palette.accent)
                                 .rounding(egui::Rounding::same(3.0));
                             ui.add(bar);
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let percent = (self.percent * 100.0).round() as i32;
-                                ui.label(egui::RichText::new(format!("{}%", percent)).size(11.5).color(MUTED));
+                                ui.label(egui::RichText::new(format!("{}%", percent)).size(11.5).color(self.palette.muted));
                             });
                         });
                         ui.add_space(4.0);
                         if self.result.is_none() {
                             ui.add(
-                                egui::Label::new(egui::RichText::new(&self.status).size(12.0).color(MUTED)).wrap(),
+                                egui::Label::new(egui::RichText::new(&self.status).size(12.0).color(self.palette.muted)).wrap(),
                             );
                         }
 
                         if let Some(result) = &self.result {
                             ui.add_space(6.0);
-                            let color = if result.ok { MUTED } else { DANGER };
+                            let color = if result.ok { self.palette.muted } else { self.palette.danger };
                             ui.add(
                                 egui::Label::new(egui::RichText::new(&result.message).size(11.5).color(color))
                                     .wrap(),
@@ -454,7 +626,7 @@ impl eframe::App for App {
                             }
                             if !result.detail.is_empty() && !result.ok {
                                 ui.add(
-                                    egui::Label::new(egui::RichText::new(&result.detail).size(11.0).color(MUTED))
+                                    egui::Label::new(egui::RichText::new(&result.detail).size(11.0).color(self.palette.muted))
                                         .wrap(),
                                 );
                             }
@@ -471,7 +643,7 @@ impl eframe::App for App {
                         egui::Label::new(
                             egui::RichText::new(format!("Остаток сохранён: {}", shorten_path(&path, 64)))
                                 .size(10.5)
-                                .color(MUTED),
+                                .color(self.palette.muted),
                         )
                         .truncate(),
                     );
@@ -490,10 +662,10 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.label("Перенести папку?");
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Откуда").size(10.5).color(MUTED));
+                    ui.label(egui::RichText::new("Откуда").size(10.5).color(self.palette.muted));
                     ui.add(egui::Label::new(egui::RichText::new(&plan.source).monospace().size(12.0)).truncate());
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Куда").size(10.5).color(MUTED));
+                    ui.label(egui::RichText::new("Куда").size(10.5).color(self.palette.muted));
                     ui.add(
                         egui::Label::new(egui::RichText::new(&plan.dest_final).monospace().size(12.0)).truncate(),
                     );
@@ -501,14 +673,16 @@ impl eframe::App for App {
                     ui.label(
                         egui::RichText::new("Сначала копия будет сверена, и только потом старый путь станет ссылкой.")
                             .size(11.5)
-                            .color(MUTED),
+                            .color(self.palette.muted),
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add(egui::Button::new(egui::RichText::new("Перенести").color(egui::Color32::WHITE))
-                                .fill(ACCENT)
-                                .min_size(egui::vec2(120.0, 30.0)))
+                            .add(egui::Button::new(
+                                egui::RichText::new("Перенести").color(self.palette.on_accent),
+                            )
+                            .fill(self.palette.accent)
+                            .min_size(egui::vec2(120.0, 30.0)))
                             .clicked()
                         {
                             accept = true;
@@ -556,7 +730,7 @@ impl eframe::App for App {
                             egui::Label::new(
                                 egui::RichText::new(format!("Показаны первые 100, всего {}", count))
                                     .size(10.5)
-                                    .color(MUTED),
+                                    .color(self.palette.muted),
                             )
                             .truncate(),
                         );
@@ -633,6 +807,7 @@ fn main() -> eframe::Result<()> {
     let mut demo = false;
     let mut demo_result = false;
     let mut demo_journals = false;
+    let mut theme_override: Option<Theme> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -646,7 +821,7 @@ fn main() -> eframe::Result<()> {
                 println!("Linkerino: переносит папку и оставляет на её месте символьную ссылку.");
                 println!("  Linkerino.exe                             — графический интерфейс");
                 println!("  Linkerino.exe --transfer <папка> <куда>   — перенос без интерфейса");
-                println!("  Linkerino.exe --screenshot <файл> [--demo] — сохранить снимок окна и выйти");
+                println!("  Linkerino.exe --screenshot <файл> [--demo] [--theme light|dark] — снимок окна и выход");
                 std::process::exit(0);
             }
             "--screenshot" => {
@@ -658,6 +833,12 @@ fn main() -> eframe::Result<()> {
             "--demo" => demo = true,
             "--demo-result" => demo_result = true,
             "--demo-journals" => demo_journals = true,
+            "--theme" => {
+                if index + 1 < args.len() {
+                    theme_override = Some(theme_from_key(&args[index + 1]));
+                    index += 1;
+                }
+            }
             _ => {}
         }
         index += 1;
@@ -674,6 +855,28 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Linkerino",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, screenshot, demo, demo_result, demo_journals)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, screenshot, demo, demo_result, demo_journals, theme_override)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_parsing() {
+        assert_eq!(parse_theme("theme=dark\n"), Theme::Dark);
+        assert_eq!(parse_theme("theme=light\n"), Theme::Light);
+        assert_eq!(parse_theme("dark"), Theme::Dark);
+        assert_eq!(parse_theme("theme=unknown\n"), Theme::Light);
+        assert_eq!(parse_theme(""), Theme::Light);
+        assert_eq!(parse_theme("something=else\n"), Theme::Light);
+    }
+
+    #[test]
+    fn theme_keys_roundtrip() {
+        assert_eq!(theme_from_key(Theme::Dark.key()), Theme::Dark);
+        assert_eq!(theme_from_key(Theme::Light.key()), Theme::Light);
+        assert_eq!(theme_from_key("DARK"), Theme::Dark);
+    }
 }
