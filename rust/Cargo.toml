@@ -1,6 +1,6 @@
 [package]
 name = "linkerino"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
 description = "Move a folder to another disk and replace it with a directory symlink"
 license = "MIT"

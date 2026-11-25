@@ -6,15 +6,15 @@
 
 | Файл | Ответственность |
 |---|---|
-| `rust/Cargo.toml` | Пакет `linkerino` 2.0.1: `[lib]` + бинарник `Linkerino`, `build.rs`, release-профиль `opt-level="z"`, LTO, `panic=abort`, strip |
-| `rust/build.rs` | Ресурсы Windows через `winres`: иконка из `assets/linkerino.ico`, `ProductName`, `FileDescription`, версия 2.0.1 |
+| `rust/Cargo.toml` | Пакет `linkerino` 2.0.2: `[lib]` + бинарник `Linkerino`, `build.rs`, release-профиль `opt-level="z"`, LTO, `panic=abort`, strip |
+| `rust/build.rs` | Ресурсы Windows через `winres`: иконка из `assets/linkerino.ico`, `ProductName`, `FileDescription`, версия из `Cargo.toml` (2.0.2) |
 | `rust/assets/` | `linkerino.ico` (16–256), `linkerino-256.png` для окна, `linkerino-1024.png` — исходник |
 | `.cargo/config.toml` | `+crt-static` для x86_64-pc-windows-msvc: CRT вкомпилирован, Visual C++ Redistributable не нужен |
 | `rust/src/lib.rs` | Точка сборки библиотеки: `pub mod engine; pub mod win;` |
 | `rust/src/win.rs` | Win32 через `windows-sys`: пути (`\\?\`), канонизация, атрибуты, `MoveFileExW`, `file_info` (`FileId`), жёсткие ссылки, `symlink`, потоки (`FileStreamInfo`), reparse-точки (`read_reparse`, `write_junction`), DACL (`acl_signature`, `apply_acl`, `dacl_protected`), том (`volume_root`, `volume_info`, `free_space`, `flush_volume`), тексты ошибок |
 | `rust/src/engine.rs` | `Phase`, `Progress`, `Sink`, `Faults`, `Plan`, `Outcome`; `build_plan`, `execute`, снимок `scan_dir`, группы жёстких ссылок, `probe_caps`/`probe_acl`, `copy_tree`, `verify_tree` + `verify_path_set` (сверка набора путей), `verify_source_unchanged`, журнал, `delete_backup`, `unfinished_journals` |
-| `rust/src/main.rs` | Окно egui: карточки путей, итоговый путь, прогресс, статус, подтверждение, итог, путь остатка и кнопки (путь и кнопки видны всегда, сообщение итога прокручивается), окно незавершённых журналов; режимы `--transfer`, `--screenshot`, `--demo`, `--demo-result`; системный шрифт Segoe UI |
-| `rust/tests/engine_tests.rs` | 16 интеграционных тестов движка на временных каталогах |
+| `rust/src/main.rs` | Окно egui: карточки путей, итоговый путь, прогресс, статус, подтверждение, итог, путь остатка и кнопки (путь и кнопки видны всегда, сообщение итога прокручивается), окно незавершённых журналов с прокруткой и кнопками «Понятно»/«Открыть папку журналов»; режимы `--transfer`, `--screenshot`, `--demo`, `--demo-result`, `--demo-journals`; системный шрифт Segoe UI |
+| `rust/tests/engine_tests.rs` | 17 интеграционных тестов движка на временных каталогах |
 | `scripts/smoke-rust.ps1` | Перенос без интерфейса, проверка ссылки, окно, два снимка окна |
 | `scripts/make-icon.py` | Dev-скрипт перерисовки иконки (Pillow): ICO 16–256 и PNG; в поставку не входит |
 
@@ -24,16 +24,16 @@
 - `execute(plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome` — рабочий поток; `leftover` — где остались данные, `notes` — что не перенесено, `needs_elevation` — не хватило прав (1314).
 - `Sink::progress` вызывается не чаще 100 мс, кроме принудительных вызовов на границах фаз; `Sink::cancelled` опрашивается только до `Publish`.
 - `Faults` есть только у Rust-тестов: `copy_failure`, `verify_mismatch`, `link_failure`, `low_space`, `force_flush_failure`, `tamper_extra`, `tamper_missing` (две последние подменяют копию, чтобы проверить сверку набора путей).
-- Журнал: тот же формат и папка `%LOCALAPPDATA%\Linkerino`; состояния `start`, `copying`, `verified`, `published`, `backup`, `linked`, `cleanup-partial`, `cleanup-skipped-durability`, `link-lost`, `failed`, `cancelled`, `relink-failed`.
+- Журнал: папка `%LOCALAPPDATA%\Linkerino` (переопределяется `LINKERINO_JOURNAL_DIR`, тесты пишут во временную папку); состояния `start`, `copying`, `verified`, `published`, `backup`, `linked`, `cleanup-partial`, `cleanup-skipped`, `cleanup-skipped-durability`, `link-lost`, `failed`, `cancelled`, `relink-failed`. `unfinished_journals` возвращает журналы в состояниях `start`/`copying`/`verified`/`published`/`backup` и журналы без строки `state` (обрезанная запись); завершённые исходы остаются на диске, но окно о них не предупреждает.
 - Порядок и инварианты совпадают с C++: staging → сверка → публикация → резерв → ссылка → сверка → сброс тома → удаление с повторной проверкой. `verify_tree` дополнительно сравнивает набор путей с исходным снимком: пропавший или лишний объект останавливает перенос.
 - Отличия Rust-версии: проверка прав на ссылку выполняется пробной ссылкой до создания staging; при неудаче `needs_elevation` выставляется, но автоперезапуск с правами в интерфейсе пока не сделан — пользователь видит текст ошибки.
 
 ### Проверено на Rust
 
-- `cargo test --release -- --test-threads=1`: 16 тестов, все проходят (NTFS, Windows 10 22H2, права администратора). Без прав на ссылку тесты теперь падают с явным сообщением, а не пропускаются молча; журналы тестовых прогонов удаляются вместе с временным каталогом.
+- `cargo test --release -- --test-threads=1`: 17 тестов, все проходят (NTFS, Windows 10 22H2, права администратора). Без прав на ссылку тесты падают с явным сообщением, а не пропускаются молча; тестовые журналы пишутся во временную папку через `LINKERINO_JOURNAL_DIR` и не попадают в профиль пользователя.
 - `basic_move` требует удаления резерва после успеха — это же подтверждает рабочий `flush_volume` на локальном томе.
 - `scripts/smoke-rust.ps1`: перенос через `--transfer`, ссылка и данные на месте, окно создаётся и закрывается, оба снимка окна сохраняются.
-- Сборка release: `rust\target\release\Linkerino.exe`, ~3,1 МБ, без импорта `VCRUNTIME140.dll` (статический CRT). Иконка и сведения о версии 2.0.1 встроены в EXE, окно получает ту же иконку.
+- Сборка release: `rust\target\release\Linkerino.exe`, ~3,1 МБ, без импорта `VCRUNTIME140.dll` (статический CRT). Иконка и сведения о версии 2.0.2 встроены в EXE, окно получает ту же иконку.
 
 ### Не проверено на Rust
 

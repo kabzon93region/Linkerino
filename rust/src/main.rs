@@ -88,7 +88,13 @@ fn save_screenshot(image: &egui::ColorImage, path: &std::path::Path) {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<PathBuf>, demo: bool, demo_result: bool) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        screenshot: Option<PathBuf>,
+        demo: bool,
+        demo_result: bool,
+        demo_journals: bool,
+    ) -> Self {
         let mut fonts = egui::FontDefinitions::default();
         if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
             fonts.font_data.insert("segoe".to_owned(), egui::FontData::from_owned(bytes));
@@ -156,6 +162,14 @@ impl App {
                 ..Default::default()
             });
             app.scroll_to_result = true;
+        }
+        if demo_journals {
+            app.source = "D:\\Games\\Example".to_string();
+            app.dest = "E:\\Backup".to_string();
+            app.preview = "E:\\Backup\\Example".to_string();
+            app.journals = (1..=140)
+                .map(|index| format!("D:\\Backup\\Linkerino\\journal-example-{:08x}.txt", index))
+                .collect();
         }
         app
     }
@@ -513,21 +527,55 @@ impl eframe::App for App {
         }
 
         if !self.journals.is_empty() {
-            let mut close = false;
-            egui::Window::new("Незавершённый перенос")
+            let mut close = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+            let count = self.journals.len();
+            let title = if count == 1 {
+                "Незавершённый перенос".to_string()
+            } else {
+                format!("Незавершённые переносы: {}", count)
+            };
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.label("Найдены записи о незавершённых переносах. Проверьте папки вручную:");
+                    ui.label("Проверьте эти папки вручную — перенос мог остановиться на середине:");
                     ui.add_space(4.0);
-                    for path in &self.journals {
-                        ui.add(egui::Label::new(egui::RichText::new(path).monospace().size(11.0)).truncate());
+                    egui::ScrollArea::vertical().max_height(150.0).auto_shrink([false, false]).show(ui, |ui| {
+                        for path in self.journals.iter().take(100) {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(shorten_path(path, 74)).monospace().size(10.5),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
+                    if count > 100 {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("Показаны первые 100, всего {}", count))
+                                    .size(10.5)
+                                    .color(MUTED),
+                            )
+                            .truncate(),
+                        );
                     }
                     ui.add_space(8.0);
-                    if ui.button("Понятно").clicked() {
-                        close = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Понятно").clicked() {
+                            close = true;
+                        }
+                        if ui.button("Открыть папку журналов").clicked() {
+                            let folder = self
+                                .journals
+                                .first()
+                                .and_then(|path| std::path::Path::new(path).parent().map(|p| p.to_path_buf()));
+                            if let Some(folder) = folder {
+                                let _ = std::process::Command::new("explorer.exe").arg(folder).spawn();
+                            }
+                        }
+                    });
                 });
             if close {
                 self.journals.clear();
@@ -584,6 +632,7 @@ fn main() -> eframe::Result<()> {
     let mut screenshot: Option<PathBuf> = None;
     let mut demo = false;
     let mut demo_result = false;
+    let mut demo_journals = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -608,6 +657,7 @@ fn main() -> eframe::Result<()> {
             }
             "--demo" => demo = true,
             "--demo-result" => demo_result = true,
+            "--demo-journals" => demo_journals = true,
             _ => {}
         }
         index += 1;
@@ -624,6 +674,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Linkerino",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, screenshot, demo, demo_result)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, screenshot, demo, demo_result, demo_journals)))),
     )
 }

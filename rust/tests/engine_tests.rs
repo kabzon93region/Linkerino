@@ -14,7 +14,18 @@ impl Sink for CancelSink {
     }
 }
 
+/// Keeps test journals out of the real %LOCALAPPDATA%\Linkerino folder.
+fn init_journals() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("linkerino-rs-journals-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LINKERINO_JOURNAL_DIR", &dir);
+    });
+}
+
 fn temp_root() -> PathBuf {
+    init_journals();
     let base = std::env::temp_dir();
     let name = format!("linkerino-rs-{}", std::process::id() as u64 * 1000 + rand_suffix());
     let path = base.join(name);
@@ -394,6 +405,28 @@ fn missing_object_in_copy_is_rejected() {
     assert!(!win::path_exists(&plan.staging));
     assert!(!win::path_exists(&plan.dest_final));
     cleanup(&root);
+}
+
+#[test]
+fn only_interrupted_journals_need_attention() {
+    init_journals();
+    let dir = PathBuf::from(std::env::var("LINKERINO_JOURNAL_DIR").unwrap());
+    let pending = dir.join("journal-test-pending.txt");
+    let finished = dir.join("journal-test-finished.txt");
+    let truncated = dir.join("journal-test-truncated.txt");
+    fs::write(&pending, "state=copying\nsource=D:\\a\ndest=D:\\b\nstaging=D:\\s\nbackup=D:\\k\n\n").unwrap();
+    fs::write(&finished, "state=failed\nsource=D:\\a\ndest=D:\\b\nstaging=D:\\s\nbackup=D:\\k\nerror=x\n").unwrap();
+    fs::write(&truncated, "").unwrap();
+    let journals = engine::unfinished_journals();
+    let has_pending = journals.iter().any(|path| path == &pending);
+    let has_finished = journals.iter().any(|path| path == &finished);
+    let has_truncated = journals.iter().any(|path| path == &truncated);
+    let _ = fs::remove_file(&pending);
+    let _ = fs::remove_file(&finished);
+    let _ = fs::remove_file(&truncated);
+    assert!(has_pending, "journal in state=copying must be reported");
+    assert!(!has_finished, "finished journal must not be reported");
+    assert!(has_truncated, "a journal without a state line must be reported");
 }
 
 #[test]

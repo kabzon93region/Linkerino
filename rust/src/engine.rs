@@ -1078,10 +1078,21 @@ fn verify_source_unchanged(plan: &Plan, entries: &[Entry]) -> Result<(), String>
     Ok(())
 }
 
-fn journal_path(id: &str) -> Option<std::path::PathBuf> {
+fn journal_dir() -> Option<std::path::PathBuf> {
+    if let Ok(custom) = std::env::var("LINKERINO_JOURNAL_DIR") {
+        if !custom.trim().is_empty() {
+            let path = Path::new(custom.trim()).to_path_buf();
+            let _ = fs::create_dir_all(&path);
+            return Some(path);
+        }
+    }
     let base = std::env::var("LOCALAPPDATA").ok().map(|v| format!("{}\\Linkerino", v))?;
     let _ = fs::create_dir_all(&base);
-    Some(Path::new(&base).join(format!("journal-{}.txt", id)))
+    Some(Path::new(&base).to_path_buf())
+}
+
+fn journal_path(id: &str) -> Option<std::path::PathBuf> {
+    Some(journal_dir()?.join(format!("journal-{}.txt", id)))
 }
 
 fn write_journal(id: &str, plan: &Plan, state: &str, extra: &str) {
@@ -1503,15 +1514,28 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
     }
 }
 
+/// Journals that describe a transfer that may have stopped mid-way.
+/// Finished outcomes (failed, cancelled, relink-failed, cleanup-*) are kept on disk but do not
+/// need to be shown at startup: the user already saw their result.
+const ATTENTION_STATES: [&str; 5] = ["start", "copying", "verified", "published", "backup"];
+
+fn journal_state(text: &str) -> &str {
+    text.lines().rev().find_map(|line| line.strip_prefix("state=")).unwrap_or("").trim()
+}
+
 pub fn unfinished_journals() -> Vec<std::path::PathBuf> {
-    let Some(base) = std::env::var("LOCALAPPDATA").ok().map(|v| format!("{}\\Linkerino", v)) else {
-        return Vec::new();
-    };
+    let Some(base) = journal_dir() else { return Vec::new() };
     let mut result = Vec::new();
     if let Ok(read_dir) = fs::read_dir(&base) {
         for item in read_dir.flatten() {
             let name = item.file_name().to_string_lossy().to_string();
-            if name.starts_with("journal-") && name.ends_with(".txt") {
+            if !name.starts_with("journal-") || !name.ends_with(".txt") {
+                continue;
+            }
+            let text = fs::read_to_string(item.path()).unwrap_or_default();
+            let state = journal_state(&text);
+            // An empty state means the journal was cut short, so it needs attention too.
+            if state.is_empty() || ATTENTION_STATES.contains(&state) {
                 result.push(item.path());
             }
         }
