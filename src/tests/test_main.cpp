@@ -134,6 +134,11 @@ bool ReadStream(const std::wstring& path, const std::wstring& stream, std::strin
     return ReadBytes(path + L":" + stream + L":$DATA", data);
 }
 
+std::wstring CanonicalOrSelf(const std::wstring& path) {
+    DWORD error = ERROR_SUCCESS;
+    const std::wstring canonical = CanonicalPath(path, &error);
+    return canonical.empty() ? path : canonical;
+}
 bool IsSymlinkTo(const std::wstring& link, const std::wstring& target) {
     const DWORD attrs = GetFileAttributesW(ApiPath(link).c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
@@ -245,7 +250,7 @@ void TestBasicMove() {
     Check(PrepareSource(source), L"prepare source");
     const Plan plan = BuildPlan(source, dest_parent);
     Check(plan.valid, L"plan is valid: " + plan.error);
-    Check(PathsEqual(plan.dest_final, JoinPath(dest_parent, L"Data")), L"final path is dest\\Data");
+    Check(PathsEqual(plan.dest_final, JoinPath(CanonicalOrSelf(dest_parent), L"Data")), L"final path is dest\\Data");
     CountingSink sink;
     const Outcome outcome = Execute(plan, &sink, Faults());
     Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
@@ -396,6 +401,7 @@ void TestReparseInsideCopied() {
         RemoveTree(root);
         return;
     }
+    const std::wstring expected_target = CanonicalOrSelf(JoinPath(source, L"data"));
     const Plan plan = BuildPlan(source, dest_parent);
     Check(plan.valid, L"plan valid before scan: " + plan.error);
     const Outcome outcome = Execute(plan, nullptr, Faults());
@@ -406,7 +412,7 @@ void TestReparseInsideCopied() {
           L"symlink recreated in the copy");
     std::wstring substitute;
     Check(ReadSubstituteName(link_copy, substitute), L"symlink target readable");
-    std::wstring expected = L"\\??\\" + JoinPath(source, L"data");
+    std::wstring expected = L"\\??\\" + expected_target;
     Check(PathsEqual(substitute, expected), L"symlink target preserved: " + substitute);
     std::string content;
     Check(ReadBytes(JoinPath(link_copy, L"file.txt"), content) && content == "linked payload",
@@ -870,13 +876,14 @@ void TestRelativeSymlinkOutside() {
         RemoveTree(root);
         return;
     }
+    const std::wstring expected_external = CanonicalOrSelf(external);
     const Plan plan = BuildPlan(source, dest_parent);
     Check(plan.valid, L"plan valid: " + plan.error);
     const Outcome outcome = Execute(plan, nullptr, Faults());
     Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
     std::wstring substitute;
     Check(ReadSubstituteName(JoinPath(plan.dest_final, L"rel"), substitute), L"link target readable");
-    Check(PathsEqual(substitute, L"\\??\\" + external), L"relative outside link became absolute: " + substitute);
+    Check(PathsEqual(substitute, L"\\??\\" + expected_external), L"relative outside link became absolute: " + substitute);
     std::string content;
     Check(ReadBytes(JoinPath(plan.dest_final, L"rel\\payload.txt"), content) && content == "outside payload",
           L"outside link still points to the same place");
@@ -972,6 +979,7 @@ void TestLongPathWithLinks() {
         return;
     }
     const Plan plan = BuildPlan(source, dest_parent);
+    const std::wstring expected_link_target = CanonicalOrSelf(target_dir);
     Check(plan.valid, L"plan valid: " + plan.error);
     const Outcome outcome = Execute(plan, nullptr, Faults());
     Check(outcome.ok, L"execute ok: " + outcome.message + L" / " + outcome.detail);
@@ -983,7 +991,7 @@ void TestLongPathWithLinks() {
     Check(one.file_index == two.file_index, L"long path hard link recreated");
     std::wstring substitute;
     Check(ReadSubstituteName(JoinPath(copied, L"deep-symlink"), substitute), L"long path symlink readable");
-    Check(PathsEqual(substitute, L"\\??\\" + target_dir), L"long path symlink target preserved: " + substitute);
+    Check(PathsEqual(substitute, L"\\??\\" + expected_link_target), L"long path symlink target preserved: " + substitute);
     std::string link_content;
     Check(ReadBytes(JoinPath(copied, L"deep-symlink\\linked.txt"), link_content) &&
               link_content == "long link payload",
