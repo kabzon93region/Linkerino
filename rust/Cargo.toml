@@ -1,9 +1,10 @@
 [package]
 name = "linkerino"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 description = "Move a folder to another disk and replace it with a directory symlink"
 license = "MIT"
+build = "build.rs"
 
 [lib]
 name = "linkerino"
@@ -38,3 +39,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[build-dependencies]
+winres = "0.1"

@@ -6,7 +6,9 @@
 
 | Файл | Ответственность |
 |---|---|
-| `rust/Cargo.toml` | Пакет `linkerino` 2.0: `[lib]` + бинарник `Linkerino`, release-профиль `opt-level="z"`, LTO, `panic=abort`, strip |
+| `rust/Cargo.toml` | Пакет `linkerino` 2.0.1: `[lib]` + бинарник `Linkerino`, `build.rs`, release-профиль `opt-level="z"`, LTO, `panic=abort`, strip |
+| `rust/build.rs` | Ресурсы Windows через `winres`: иконка из `assets/linkerino.ico`, `ProductName`, `FileDescription`, версия 2.0.1 |
+| `rust/assets/` | `linkerino.ico` (16–256), `linkerino-256.png` для окна, `linkerino-1024.png` — исходник |
 | `.cargo/config.toml` | `+crt-static` для x86_64-pc-windows-msvc: CRT вкомпилирован, Visual C++ Redistributable не нужен |
 | `rust/src/lib.rs` | Точка сборки библиотеки: `pub mod engine; pub mod win;` |
 | `rust/src/win.rs` | Win32 через `windows-sys`: пути (`\\?\`), канонизация, атрибуты, `MoveFileExW`, `file_info` (`FileId`), жёсткие ссылки, `symlink`, потоки (`FileStreamInfo`), reparse-точки (`read_reparse`, `write_junction`), DACL (`acl_signature`, `apply_acl`, `dacl_protected`), том (`volume_root`, `volume_info`, `free_space`, `flush_volume`), тексты ошибок |
@@ -14,6 +16,7 @@
 | `rust/src/main.rs` | Окно egui: карточки путей, итоговый путь, прогресс, статус, подтверждение, итог, путь остатка и кнопки (путь и кнопки видны всегда, сообщение итога прокручивается), окно незавершённых журналов; режимы `--transfer`, `--screenshot`, `--demo`, `--demo-result`; системный шрифт Segoe UI |
 | `rust/tests/engine_tests.rs` | 16 интеграционных тестов движка на временных каталогах |
 | `scripts/smoke-rust.ps1` | Перенос без интерфейса, проверка ссылки, окно, два снимка окна |
+| `scripts/make-icon.py` | Dev-скрипт перерисовки иконки (Pillow): ICO 16–256 и PNG; в поставку не входит |
 
 ### Контракты Rust
 
@@ -30,7 +33,7 @@
 - `cargo test --release -- --test-threads=1`: 16 тестов, все проходят (NTFS, Windows 10 22H2, права администратора). Без прав на ссылку тесты теперь падают с явным сообщением, а не пропускаются молча; журналы тестовых прогонов удаляются вместе с временным каталогом.
 - `basic_move` требует удаления резерва после успеха — это же подтверждает рабочий `flush_volume` на локальном томе.
 - `scripts/smoke-rust.ps1`: перенос через `--transfer`, ссылка и данные на месте, окно создаётся и закрывается, оба снимка окна сохраняются.
-- Сборка release: `rust\target\release\Linkerino.exe`, ~3,1 МБ, без импорта `VCRUNTIME140.dll` (статический CRT).
+- Сборка release: `rust\target\release\Linkerino.exe`, ~3,1 МБ, без импорта `VCRUNTIME140.dll` (статический CRT). Иконка и сведения о версии 2.0.1 встроены в EXE, окно получает ту же иконку.
 
 ### Не проверено на Rust
 

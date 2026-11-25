@@ -574,6 +574,11 @@ fn run_cli(args: &[String]) -> i32 {
     code
 }
 
+fn window_icon() -> Option<egui::IconData> {
+    let image = image::load_from_memory(include_bytes!("../assets/linkerino-256.png")).ok()?.to_rgba8();
+    Some(egui::IconData { rgba: image.as_raw().clone(), width: image.width(), height: image.height() })
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut screenshot: Option<PathBuf> = None;
@@ -607,14 +612,15 @@ fn main() -> eframe::Result<()> {
         }
         index += 1;
     }
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 412.0])
-            .with_min_inner_size([560.0, 412.0])
-            .with_resizable(false)
-            .with_title("Linkerino"),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([560.0, 412.0])
+        .with_min_inner_size([560.0, 412.0])
+        .with_resizable(false)
+        .with_title("Linkerino");
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "Linkerino",
         options,

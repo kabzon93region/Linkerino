@@ -26,6 +26,8 @@ src/          интерфейс, движок, утилиты (C++)
 src/tests/    нативные интеграционные тесты (C++)
 rust/src/     движок и интерфейс на Rust
 rust/tests/   интеграционные тесты движка Rust
+rust/assets/  иконка: linkerino.ico и PNG-варианты
+rust/build.rs ресурсы Windows: иконка и сведения о версии
 .cargo/       config.toml: статический CRT для Rust (+crt-static)
 docs/         спецификация, план, карта кода
 build/        артефакты CMake (не читать, не коммитить)
@@ -33,7 +35,7 @@ rust/target/  артефакты cargo (не читать, не коммитит
 ```
 
 - Не трогать реальные папки пользователя (`C:\atiflash`, `B:\BKP`) — все проверки только на временных каталогах.
-- Не использовать .NET, WSL, Docker, сторонние библиотеки. Исключение — Rust-сборка: только crates из `rust/Cargo.toml` (`eframe`/`egui`, `sha2`, `rfd`, `windows-sys`, `image`).
+- Не использовать .NET, WSL, Docker, сторонние библиотеки. Исключение — Rust-сборка: только crates из `rust/Cargo.toml` (`eframe`/`egui`, `sha2`, `rfd`, `windows-sys`, `image`; сборочная зависимость `winres` для иконки и версии). `Pillow` в `scripts/make-icon.py` — только dev-инструмент, в поставку не входит.
 
 ## Соглашения
 
