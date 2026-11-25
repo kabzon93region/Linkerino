@@ -168,6 +168,23 @@ struct App {
     theme_locked: bool,
 }
 
+fn draw_sun(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    painter.circle_stroke(center, 2.6, egui::Stroke::new(1.2_f32, color));
+    for index in 0..8 {
+        let angle = std::f32::consts::TAU * index as f32 / 8.0;
+        let direction = egui::vec2(angle.cos(), angle.sin());
+        painter.line_segment(
+            [center + direction * 4.4, center + direction * 6.6],
+            egui::Stroke::new(1.2_f32, color),
+        );
+    }
+}
+
+fn draw_moon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32, background: egui::Color32) {
+    painter.circle_filled(center, 5.2, color);
+    painter.circle_filled(center + egui::vec2(2.6, -1.4), 4.6, background);
+}
+
 /// Keeps both the beginning and the end of a long path visible.
 fn shorten_path(path: &str, max: usize) -> String {
     let chars: Vec<char> = path.chars().collect();
@@ -220,8 +237,8 @@ impl App {
         cc.egui_ctx.set_fonts(fonts);
 
         let mut style = (*cc.egui_ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+        style.spacing.button_padding = egui::vec2(9.0, 3.0);
         style.visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
         style.visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
         style.visuals.widgets.active.rounding = egui::Rounding::same(8.0);
@@ -326,18 +343,30 @@ impl App {
     }
 
     fn theme_switch(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let mut chosen = None;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if ui.selectable_label(self.theme == Theme::Light, "Светлая").clicked() {
-                chosen = Some(Theme::Light);
-            }
-            if ui.selectable_label(self.theme == Theme::Dark, "Тёмная").clicked() {
-                chosen = Some(Theme::Dark);
-            }
-        });
-        if let Some(theme) = chosen {
-            self.set_theme(theme, ctx);
+        let palette = &self.palette;
+        let dark = self.theme == Theme::Dark;
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(52.0, 24.0), egui::Sense::click());
+        let rounding = egui::Rounding::same(12.0);
+        let painter = ui.painter();
+        painter.rect_filled(rect, rounding, palette.track);
+        painter.rect_stroke(rect, rounding, egui::Stroke::new(1.0_f32, palette.edge));
+
+        let sun = egui::pos2(rect.left() + 13.0, rect.center().y);
+        let moon = egui::pos2(rect.right() - 13.0, rect.center().y);
+        let knob = if dark { moon } else { sun };
+        painter.circle_filled(knob, 9.0, palette.text);
+
+        if dark {
+            draw_sun(painter, sun, palette.muted);
+            draw_moon(painter, moon, palette.surface, palette.text);
+        } else {
+            draw_moon(painter, moon, palette.muted, palette.track);
+            draw_sun(painter, sun, palette.surface);
+        }
+
+        let hint = if dark { "Тёмная тема — нажмите, чтобы включить светлую" } else { "Светлая тема — нажмите, чтобы включить тёмную" };
+        if response.on_hover_text(hint).clicked() {
+            self.set_theme(if dark { Theme::Light } else { Theme::Dark }, ctx);
         }
     }
 
@@ -419,15 +448,17 @@ impl App {
         let mut changed = false;
         egui::Frame::none()
             .fill(palette.surface)
-            .rounding(egui::Rounding::same(10.0))
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::symmetric(10.0, 4.0))
             .stroke(egui::Stroke::new(1.0_f32, palette.edge))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(title).size(10.5).color(palette.muted));
-                ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    let button_width = 74.0;
+                    ui.add_sized(
+                        egui::vec2(52.0, 20.0),
+                        egui::Label::new(egui::RichText::new(title).size(9.5).color(palette.muted)),
+                    );
+                    let button_width = 66.0;
                     let spacing = ui.spacing().item_spacing.x;
                     let edit_width = (ui.available_width() - if browse { button_width + spacing } else { 0.0 }).max(60.0);
                     let response = ui.add(
@@ -437,10 +468,16 @@ impl App {
                             .frame(false),
                     );
                     changed = response.changed();
-                    if browse && ui.button("Обзор…").clicked() {
-                        if let Some(picked) = App::browse("Выберите папку") {
-                            *value = picked;
-                            changed = true;
+                    if browse {
+                        let button = ui.add_sized(
+                            egui::vec2(button_width, 20.0),
+                            egui::Button::new(egui::RichText::new("Обзор…").size(11.0)),
+                        );
+                        if button.clicked() {
+                            if let Some(picked) = App::browse("Выберите папку") {
+                                *value = picked;
+                                changed = true;
+                            }
                         }
                     }
                 });
@@ -454,10 +491,10 @@ impl App {
             let start_text = if can_start { self.palette.on_accent } else { self.palette.on_disabled };
             let start = ui.add_enabled(
                 can_start,
-                egui::Button::new(egui::RichText::new("Перенести").color(start_text).strong())
+                egui::Button::new(egui::RichText::new("Перенести").color(start_text).strong().size(12.5))
                     .fill(if can_start { self.palette.accent } else { self.palette.disabled })
-                    .rounding(egui::Rounding::same(8.0))
-                    .min_size(egui::vec2(150.0, 34.0)),
+                    .rounding(egui::Rounding::same(7.0))
+                    .min_size(egui::vec2(132.0, 28.0)),
             );
             if start.clicked() {
                 let plan = engine::build_plan(&self.source, &self.dest);
@@ -472,7 +509,7 @@ impl App {
                     && self.phase != engine::Phase::Link
                     && self.phase != engine::Phase::Cleanup;
                 if ui
-                    .add_enabled(cancel_enabled, egui::Button::new("Отмена").min_size(egui::vec2(100.0, 34.0)))
+                    .add_enabled(cancel_enabled, egui::Button::new("Отмена").min_size(egui::vec2(84.0, 28.0)))
                     .clicked()
                 {
                     self.cancel.store(true, Ordering::Relaxed);
@@ -525,55 +562,52 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().frame(egui::Frame::none().fill(self.palette.background)).show(ctx, |ui| {
-            ui.add_space(14.0);
+            ui.add_space(9.0);
             ui.horizontal(|ui| {
-                ui.add_space(16.0);
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("Linkerino").size(22.0).strong().color(self.palette.text));
-                    ui.label(
-                        egui::RichText::new("Перенести папку и оставить на старом месте ссылку")
-                            .size(12.0)
-                            .color(self.palette.muted),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(16.0);
-                    self.theme_switch(ui, ctx);
-                });
+                ui.add_space(14.0);
+                ui.label(egui::RichText::new("Linkerino").size(20.0).strong().color(self.palette.text));
+                ui.add_space(6.0);
+                self.theme_switch(ui, ctx);
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("Перенести папку и оставить на старом месте ссылку")
+                        .size(11.0)
+                        .color(self.palette.muted),
+                );
             });
-            ui.add_space(12.0);
+            ui.add_space(8.0);
 
-            egui::Frame::none().inner_margin(egui::Margin::symmetric(16.0, 0.0)).show(ui, |ui| {
+            egui::Frame::none().inner_margin(egui::Margin::symmetric(14.0, 0.0)).show(ui, |ui| {
                 let has_leftover = self.result.as_ref().map(|r| !r.leftover.is_empty()).unwrap_or(false);
-                let footer_height = 52.0;
-                let leftover_height = if has_leftover { 22.0 } else { 0.0 };
-                let scroll_height = (ui.available_height() - footer_height - leftover_height).max(150.0);
+                let footer_height = 40.0;
+                let leftover_height = if has_leftover { 18.0 } else { 0.0 };
+                let scroll_height = (ui.available_height() - footer_height - leftover_height).max(120.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .max_height(scroll_height)
                     .show(ui, |ui| {
                         let mut changed = App::card(ui, &self.palette, "ОТКУДА", &mut self.source, true);
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
                         changed |= App::card(ui, &self.palette, "КУДА", &mut self.dest, true);
                         if changed {
                             self.refresh_preview();
                         }
 
-                        ui.add_space(10.0);
+                        ui.add_space(7.0);
                         if !self.preview.is_empty() {
                             egui::Frame::none()
                                 .fill(self.palette.preview)
-                                .rounding(egui::Rounding::same(8.0))
-                                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                .rounding(egui::Rounding::same(7.0))
+                                .inner_margin(egui::Margin::symmetric(9.0, 4.0))
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new("Станет").size(11.0).color(self.palette.muted));
+                                        ui.label(egui::RichText::new("Станет").size(10.5).color(self.palette.muted));
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(&self.preview)
                                                     .monospace()
-                                                    .size(12.0)
+                                                    .size(11.5)
                                                     .color(self.palette.accent),
                                             )
                                             .truncate(),
@@ -582,32 +616,33 @@ impl eframe::App for App {
                                 });
                         } else if !self.preview_error.is_empty() {
                             ui.add(
-                                egui::Label::new(egui::RichText::new(&self.preview_error).size(11.5).color(self.palette.danger))
+                                egui::Label::new(egui::RichText::new(&self.preview_error).size(11.0).color(self.palette.danger))
                                     .wrap(),
                             );
                         } else {
-                            ui.label(egui::RichText::new("Выберите обе папки").size(11.5).color(self.palette.muted));
+                            ui.label(egui::RichText::new("Выберите обе папки").size(11.0).color(self.palette.muted));
                         }
 
-                        ui.add_space(8.0);
+                        ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            let percent_width = 40.0;
+                            let percent_width = 54.0;
                             ui.visuals_mut().extreme_bg_color = self.palette.track;
                             let bar = egui::ProgressBar::new(self.percent)
                                 .desired_width((ui.available_width() - percent_width).max(80.0))
-                                .desired_height(6.0)
+                                .desired_height(5.0)
                                 .fill(self.palette.accent)
                                 .rounding(egui::Rounding::same(3.0));
                             ui.add(bar);
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_space(12.0);
                                 let percent = (self.percent * 100.0).round() as i32;
-                                ui.label(egui::RichText::new(format!("{}%", percent)).size(11.5).color(self.palette.muted));
+                                ui.label(egui::RichText::new(format!("{}%", percent)).size(10.5).color(self.palette.muted));
                             });
                         });
                         ui.add_space(4.0);
                         if self.result.is_none() {
                             ui.add(
-                                egui::Label::new(egui::RichText::new(&self.status).size(12.0).color(self.palette.muted)).wrap(),
+                                egui::Label::new(egui::RichText::new(&self.status).size(11.5).color(self.palette.muted)).wrap(),
                             );
                         }
 
@@ -615,18 +650,18 @@ impl eframe::App for App {
                             ui.add_space(6.0);
                             let color = if result.ok { self.palette.muted } else { self.palette.danger };
                             ui.add(
-                                egui::Label::new(egui::RichText::new(&result.message).size(11.5).color(color))
+                                egui::Label::new(egui::RichText::new(&result.message).size(11.0).color(color))
                                     .wrap(),
                             );
                             if !result.notes.is_empty() {
                                 ui.add(
-                                    egui::Label::new(egui::RichText::new(&result.notes).size(11.5).color(color))
+                                    egui::Label::new(egui::RichText::new(&result.notes).size(10.5).color(color))
                                         .wrap(),
                                 );
                             }
                             if !result.detail.is_empty() && !result.ok {
                                 ui.add(
-                                    egui::Label::new(egui::RichText::new(&result.detail).size(11.0).color(self.palette.muted))
+                                    egui::Label::new(egui::RichText::new(&result.detail).size(10.5).color(self.palette.muted))
                                         .wrap(),
                                 );
                             }
@@ -641,7 +676,7 @@ impl eframe::App for App {
                     let path = self.result.as_ref().map(|r| r.leftover.clone()).unwrap_or_default();
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(format!("Остаток сохранён: {}", shorten_path(&path, 64)))
+                            egui::RichText::new(format!("Остаток сохранён: {}", shorten_path(&path, 70)))
                                 .size(10.5)
                                 .color(self.palette.muted),
                         )
@@ -663,11 +698,11 @@ impl eframe::App for App {
                     ui.label("Перенести папку?");
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Откуда").size(10.5).color(self.palette.muted));
-                    ui.add(egui::Label::new(egui::RichText::new(&plan.source).monospace().size(12.0)).truncate());
+                    ui.add(egui::Label::new(egui::RichText::new(&plan.source).monospace().size(11.5)).truncate());
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("Куда").size(10.5).color(self.palette.muted));
                     ui.add(
-                        egui::Label::new(egui::RichText::new(&plan.dest_final).monospace().size(12.0)).truncate(),
+                        egui::Label::new(egui::RichText::new(&plan.dest_final).monospace().size(11.5)).truncate(),
                     );
                     ui.add_space(6.0);
                     ui.label(
@@ -682,7 +717,7 @@ impl eframe::App for App {
                                 egui::RichText::new("Перенести").color(self.palette.on_accent),
                             )
                             .fill(self.palette.accent)
-                            .min_size(egui::vec2(120.0, 30.0)))
+                            .min_size(egui::vec2(112.0, 26.0)))
                             .clicked()
                         {
                             accept = true;
@@ -844,8 +879,8 @@ fn main() -> eframe::Result<()> {
         index += 1;
     }
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([560.0, 412.0])
-        .with_min_inner_size([560.0, 412.0])
+        .with_inner_size([560.0, 320.0])
+        .with_min_inner_size([560.0, 320.0])
         .with_resizable(false)
         .with_title("Linkerino");
     if let Some(icon) = window_icon() {

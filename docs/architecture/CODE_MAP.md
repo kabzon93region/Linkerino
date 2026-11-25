@@ -1,19 +1,19 @@
 # Карта кода: Linkerino
 
-Обновлено: 2026-11-25 (версии 1.1 и 2.1). Источник истины — код; карта помогает навигации.
+Обновлено: 2026-11-25 (версии 1.1 и 2.1.1). Источник истины — код; карта помогает навигации.
 
-## Версия 2.0 на Rust
+## Версия 2.x на Rust
 
 | Файл | Ответственность |
 |---|---|
-| `rust/Cargo.toml` | Пакет `linkerino` 2.1.0: `[lib]` + бинарник `Linkerino`, `build.rs`, release-профиль `opt-level="z"`, LTO, `panic=abort`, strip |
-| `rust/build.rs` | Ресурсы Windows через `winres`: иконка из `assets/linkerino.ico`, `ProductName`, `FileDescription`, версия из `Cargo.toml` (2.1.0) |
+| `rust/Cargo.toml` | Пакет `linkerino` 2.1.1: `[lib]` + бинарник `Linkerino`, `build.rs`, release-профиль `opt-level="z"`, LTO, `panic=abort`, strip |
+| `rust/build.rs` | Ресурсы Windows через `winres`: иконка из `assets/linkerino.ico`, `ProductName`, `FileDescription`, версия из `Cargo.toml` (2.1.1) |
 | `rust/assets/` | `linkerino.ico` (16–256), `linkerino-256.png` для окна, `linkerino-1024.png` — исходник |
 | `.cargo/config.toml` | `+crt-static` для x86_64-pc-windows-msvc: CRT вкомпилирован, Visual C++ Redistributable не нужен |
 | `rust/src/lib.rs` | Точка сборки библиотеки: `pub mod engine; pub mod win;` |
 | `rust/src/win.rs` | Win32 через `windows-sys`: пути (`\\?\`), канонизация, атрибуты, `MoveFileExW`, `file_info` (`FileId`), жёсткие ссылки, `symlink`, потоки (`FileStreamInfo`), reparse-точки (`read_reparse`, `write_junction`), DACL (`acl_signature`, `apply_acl`, `dacl_protected`), том (`volume_root`, `volume_info`, `free_space`, `flush_volume`), тексты ошибок |
 | `rust/src/engine.rs` | `Phase`, `Progress`, `Sink`, `Faults`, `Plan`, `Outcome`; `build_plan`, `execute`, снимок `scan_dir`, группы жёстких ссылок, `probe_caps`/`probe_acl`, `copy_tree`, `verify_tree` + `verify_path_set` (сверка набора путей), `verify_source_unchanged`, журнал, `delete_backup`, `unfinished_journals` |
-| `rust/src/main.rs` | Окно egui: карточки путей, итоговый путь, прогресс, статус, подтверждение, итог, путь остатка и кнопки (путь и кнопки видны всегда, сообщение итога прокручивается), единая палитра `Palette` и `apply_theme` для светлой и тёмной темы, переключатель «Светлая»/«Тёмная» в шапке, окно незавершённых журналов с прокруткой и кнопками «Понятно»/«Открыть папку журналов»; режимы `--transfer`, `--screenshot`, `--demo`, `--demo-result`, `--demo-journals`, `--theme`; системный шрифт Segoe UI; 2 юнит-теста разбора темы |
+| `rust/src/main.rs` | Окно egui: карточки путей в одну строку, итоговый путь, прогресс, статус, подтверждение, итог, путь остатка и кнопки (путь и кнопки видны всегда, сообщение итога прокручивается), единая палитра `Palette` и `apply_theme` для светлой и тёмной темы, тумблер темы «солнце/месяц» рядом с названием, окно незавершённых журналов с прокруткой и кнопками «Понятно»/«Открыть папку журналов»; режимы `--transfer`, `--screenshot`, `--demo`, `--demo-result`, `--demo-journals`, `--theme`; системный шрифт Segoe UI; 2 юнит-теста разбора темы |
 | `rust/tests/engine_tests.rs` | 18 интеграционных тестов движка на временных каталогах |
 | `scripts/smoke-rust.ps1` | Перенос без интерфейса, проверка ссылки, окно, три снимка окна (светлая, итог, тёмная) |
 | `scripts/make-icon.py` | Dev-скрипт перерисовки иконки (Pillow): ICO 16–256 и PNG; в поставку не входит |
@@ -35,7 +35,7 @@
 - `cargo test --release -- --test-threads=1`: 18 интеграционных тестов движка и 2 юнит-теста разбора темы, все проходят (NTFS, Windows 10 22H2, права администратора). Без прав на ссылку тесты падают с явным сообщением, а не пропускаются молча; тестовые журналы пишутся во временную папку через `LINKERINO_JOURNAL_DIR` и не попадают в профиль пользователя.
 - `basic_move` требует удаления резерва после успеха — это же подтверждает рабочий `flush_volume` на локальном томе.
 - `scripts/smoke-rust.ps1`: перенос через `--transfer`, ссылка и данные на месте, окно создаётся и закрывается, три снимка окна (светлая тема, итог, тёмная тема) сохраняются.
-- Сборка release: `rust\target\release\Linkerino.exe`, ~3,1 МБ, без импорта `VCRUNTIME140.dll` (статический CRT). Иконка и сведения о версии 2.1.0 встроены в EXE, окно получает ту же иконку.
+- Сборка release: `rust\target\release\Linkerino.exe`, ~3,1 МБ, без импорта `VCRUNTIME140.dll` (статический CRT). Иконка и сведения о версии 2.1.1 встроены в EXE, окно получает ту же иконку.
 
 ### Не проверено на Rust
 
