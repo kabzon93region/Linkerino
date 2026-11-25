@@ -4,3 +4,4 @@ out/
 *.user
 *.log
 .dsh/
+rust/target/

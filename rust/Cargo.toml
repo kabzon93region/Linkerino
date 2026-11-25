@@ -1,0 +1,40 @@
+[package]
+name = "linkerino"
+version = "2.0.0"
+edition = "2021"
+description = "Move a folder to another disk and replace it with a directory symlink"
+license = "MIT"
+
+[lib]
+name = "linkerino"
+path = "src/lib.rs"
+
+[[bin]]
+name = "Linkerino"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+sha2 = "0.10"
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_IO",
+    "Win32_System_SystemInformation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
