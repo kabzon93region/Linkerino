@@ -84,11 +84,26 @@ $exePath = (Resolve-Path -LiteralPath $Exe).Path
 
 $root = Join-Path $env:TEMP ('linkerino-rust-smoke-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root -Force | Out-Null
-$helpOut = Join-Path $root 'help-out.txt'
-$help = Start-Process -FilePath $exePath -ArgumentList '--help' -RedirectStandardOutput $helpOut `
-    -RedirectStandardError (Join-Path $root 'help-err.txt') -PassThru -Wait
-$helpText = Get-Content -LiteralPath $helpOut -Raw -Encoding UTF8
-Assert-True ($help.ExitCode -eq 0 -and $helpText -match 'transfer') 'cli help lists --transfer'
+
+function Invoke-Cli {
+    param([string[]]$Arguments)
+    $tag = [guid]::NewGuid().ToString('N')
+    $stdout = Join-Path $root ('cli-' + $tag + '.out.txt')
+    $stderr = Join-Path $root ('cli-' + $tag + '.err.txt')
+    $process = Start-Process -FilePath $exePath -ArgumentList $Arguments -RedirectStandardOutput $stdout `
+        -RedirectStandardError $stderr -PassThru -Wait
+    [pscustomobject]@{
+        Code = $process.ExitCode
+        Out = (Get-Content -LiteralPath $stdout -Raw -Encoding UTF8)
+        Err = (Get-Content -LiteralPath $stderr -Raw -Encoding UTF8)
+    }
+}
+
+$help = Invoke-Cli @('--help')
+Assert-True ($help.Code -eq 0 -and $help.Out -match '--plan' -and $help.Out -match '--json' -and $help.Out -match '--journals') 'cli --help lists commands and options'
+
+$version = Invoke-Cli @('--version')
+Assert-True ($version.Code -eq 0 -and $version.Out -match 'Linkerino \d') 'cli --version reports the program version'
 
 $source = Join-Path $root 'src\Data'
 $destParent = Join-Path $root 'dest'
@@ -98,15 +113,34 @@ New-Item -ItemType Directory -Path $destParent -Force | Out-Null
 Set-Content -LiteralPath (Join-Path $source 'hello.txt') -Value 'hello rust' -Encoding UTF8
 Set-Content -LiteralPath (Join-Path $source 'nested\data.bin') -Value 'payload' -Encoding UTF8
 
-$outFile = Join-Path $root 'cli-out.txt'
-$errFile = Join-Path $root 'cli-err.txt'
+$plan = Invoke-Cli @('--plan', $source, $destParent)
+$planLink = ([System.IO.File]::GetAttributes($source) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+Assert-True ($plan.Code -eq 0 -and -not $planLink -and $plan.Out -match 'Data') 'cli --plan only checks the paths'
+
+$dryOnly = Invoke-Cli @('--dry-run', $source, $destParent)
+$dryOnlyLink = ([System.IO.File]::GetAttributes($source) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+Assert-True ($dryOnly.Code -eq 0 -and -not $dryOnlyLink) 'cli --dry-run alone behaves like --plan'
+
+$usage = Invoke-Cli @('--transfer', $source)
+Assert-True ($usage.Code -eq 2) ('cli usage error returns exit code 2 (got ' + $usage.Code + ')')
+
+$unknown = Invoke-Cli @('--nonsense')
+Assert-True ($unknown.Code -eq 2) ('cli unknown option returns exit code 2 (got ' + $unknown.Code + ')')
+
+$usageJson = Invoke-Cli @('--nonsense', '--json')
+$usageJsonOk = $null
+try { $usageJsonOk = ($usageJson.Out | ConvertFrom-Json).ok } catch { }
+Assert-True ($usageJson.Code -eq 2 -and $usageJsonOk -eq $false) 'cli usage error with --json keeps stdout machine-readable'
+
 $sw = [Diagnostics.Stopwatch]::StartNew()
-$cli = Start-Process -FilePath $exePath -ArgumentList '--transfer', ('"' + $source + '"'), ('"' + $destParent + '"') `
-    -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -Wait
+$cli = Invoke-Cli @('--transfer', $source, $destParent, '--json', '--quiet')
 $sw.Stop()
-$cliOut = (Get-Content -LiteralPath $outFile -Raw -Encoding UTF8) + (Get-Content -LiteralPath $errFile -Raw -Encoding UTF8)
-Assert-True ($cli.ExitCode -eq 0) ('cli transfer exit code 0 (got ' + $cli.ExitCode + ')')
-if ($cli.ExitCode -ne 0) { Write-Output ('cli output: ' + $cliOut) }
+$result = $null
+try { $result = $cli.Out | ConvertFrom-Json } catch { }
+Assert-True ($cli.Code -eq 0) ('cli transfer exit code 0 (got ' + $cli.Code + ')')
+if ($cli.Code -ne 0) { Write-Output ('cli output: ' + $cli.Out + ' ' + $cli.Err) }
+Assert-True ($null -ne $result -and $result.ok -eq $true) 'cli --json returns a successful JSON result'
+Assert-True ($null -ne $result -and $result.dest -eq $destFinal) 'cli --json reports the destination'
 
 $attributes = [System.IO.File]::GetAttributes($source)
 Assert-True (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) 'source became a symlink'
@@ -116,6 +150,16 @@ Assert-True ($null -ne $content -and $content.Trim() -eq 'hello rust') 'source r
 $nested = Get-Content -LiteralPath (Join-Path $source 'nested\data.bin') -Raw -ErrorAction SilentlyContinue
 Assert-True ($null -ne $nested -and $nested.Trim() -eq 'payload') 'nested file readable'
 Write-Output ('INFO: transfer took ' + [math]::Round($sw.Elapsed.TotalSeconds, 2) + ' s')
+
+$journals = Invoke-Cli @('--journals', '--json')
+$journalCount = -1
+try { $journalCount = ($journals.Out | ConvertFrom-Json).count } catch { }
+Assert-True ($journals.Code -eq 0 -and $journalCount -eq 0) 'cli --journals reports no pending transfers'
+
+$missing = Invoke-Cli @('--plan', (Join-Path $root 'missing-folder'), $destParent, '--json')
+$missingOk = $null
+try { $missingOk = ($missing.Out | ConvertFrom-Json).ok } catch { }
+Assert-True ($missing.Code -eq 1 -and $missingOk -eq $false) 'cli --plan reports a bad path with exit code 1 and JSON ok=false'
 
 if (-not $SkipGui) {
     $shots = @(

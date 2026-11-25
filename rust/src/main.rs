@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
@@ -793,42 +793,418 @@ impl eframe::App for App {
     }
 }
 
-fn attach_console() {
-    // The release binary is a GUI subsystem app; a console is attached only for the CLI mode.
+const EXIT_OK: i32 = 0;
+const EXIT_FAILED: i32 = 1;
+const EXIT_USAGE: i32 = 2;
+const EXIT_CANCELLED: i32 = 3;
+
+static CANCEL: AtomicBool = AtomicBool::new(false);
+static INTERRUPTS: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CliCommand {
+    Help,
+    Version,
+    Journals,
+    Plan { source: String, dest: String },
+    Transfer { source: String, dest: String },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CliFlags {
+    json: bool,
+    quiet: bool,
+    dry_run: bool,
+}
+
+fn expect_no_paths(positional: &[String]) -> Result<(), String> {
+    if positional.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("Лишние параметры: {}", positional.join(" ")))
+    }
+}
+
+fn parse_cli(args: &[String]) -> Result<(CliCommand, CliFlags), String> {
+    let mut flags = CliFlags::default();
+    let mut verb: Option<&'static str> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut positional_only = false;
+    for arg in args {
+        if positional_only {
+            positional.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "--json" => flags.json = true,
+            "--quiet" | "-q" => flags.quiet = true,
+            "--dry-run" | "-n" => flags.dry_run = true,
+            "--transfer" | "/transfer" => verb = Some("transfer"),
+            "--plan" => verb = Some("plan"),
+            "--journals" => verb = Some("journals"),
+            "--version" | "-V" => verb = Some("version"),
+            "--help" | "-h" | "/?" => verb = Some("help"),
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("Неизвестный параметр: {}", other));
+            }
+            other => positional.push(other.to_string()),
+        }
+    }
+    let verb = match verb {
+        Some(verb) => Some(verb),
+        None if flags.dry_run => Some("plan"),
+        None => None,
+    };
+    let Some(verb) = verb else {
+        return Err("Не указана команда. Без параметров открывается окно.".to_string());
+    };
+    let command = match verb {
+        "help" => {
+            expect_no_paths(&positional)?;
+            CliCommand::Help
+        }
+        "version" => {
+            expect_no_paths(&positional)?;
+            CliCommand::Version
+        }
+        "journals" => {
+            expect_no_paths(&positional)?;
+            CliCommand::Journals
+        }
+        _ => {
+            if positional.len() != 2 {
+                return Err("Нужны два пути: переносимая папка и папка назначения.".to_string());
+            }
+            let source = positional[0].clone();
+            let dest = positional[1].clone();
+            if verb == "plan" || flags.dry_run {
+                CliCommand::Plan { source, dest }
+            } else {
+                CliCommand::Transfer { source, dest }
+            }
+        }
+    };
+    Ok((command, flags))
+}
+
+fn json_bool(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if (other as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", other as u32)),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn handle_is_valid(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    !handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+}
+
+/// GUI-subsystem binaries start without usable console handles, so the CLI mode takes the parent
+/// console (or allocates one) and points the standard handles at it. Redirected handles are kept.
+fn ensure_console() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Console::{
+        AllocConsole, AttachConsole, GetConsoleWindow, GetStdHandle, SetConsoleCP, SetConsoleOutputCP, SetStdHandle,
+        STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
     const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    const CP_UTF8: u32 = 65001;
     unsafe {
-        windows_sys::Win32::System::Console::AttachConsole(ATTACH_PARENT_PROCESS);
+        // Attach to the parent console even when stdout is redirected: otherwise stderr would stay
+        // dead and the progress or an error message would be lost.
+        if GetConsoleWindow().is_null() && AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            let output_missing = !handle_is_valid(GetStdHandle(STD_OUTPUT_HANDLE));
+            let errors_missing = !handle_is_valid(GetStdHandle(STD_ERROR_HANDLE));
+            if output_missing || errors_missing {
+                AllocConsole();
+            }
+        }
+        // The console receives UTF-8 bytes from Rust's std, so switch it to UTF-8 to show Cyrillic.
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+        for (std_id, device, read) in [
+            (STD_OUTPUT_HANDLE, "CONOUT$", false),
+            (STD_ERROR_HANDLE, "CONOUT$", false),
+            (STD_INPUT_HANDLE, "CONIN$", true),
+        ] {
+            if handle_is_valid(GetStdHandle(std_id)) {
+                continue;
+            }
+            let opened = if read {
+                std::fs::OpenOptions::new().read(true).open(device)
+            } else {
+                std::fs::OpenOptions::new().write(true).open(device)
+            };
+            if let Ok(file) = opened {
+                SetStdHandle(std_id, file.as_raw_handle() as _);
+                std::mem::forget(file);
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn console_ctrl_handler(event: u32) -> i32 {
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
+        if INTERRUPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+            CANCEL.store(true, Ordering::SeqCst);
+            return 1;
+        }
+    }
+    0
+}
+
+fn install_ctrl_c() {
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(console_ctrl_handler), 1);
+    }
+}
+
+struct CliSink {
+    quiet: bool,
+    last_phase: std::sync::Mutex<engine::Phase>,
+    last_bucket: AtomicU32,
+}
+
+impl CliSink {
+    fn new(quiet: bool) -> Self {
+        CliSink { quiet, last_phase: std::sync::Mutex::new(engine::Phase::Validate), last_bucket: AtomicU32::new(u32::MAX) }
+    }
+}
+
+impl engine::Sink for CliSink {
+    fn progress(&self, progress: &engine::Progress) {
+        if self.quiet {
+            return;
+        }
+        let percent = if progress.bytes_total > 0 {
+            (progress.bytes_done.saturating_mul(100) / progress.bytes_total) as u32
+        } else if progress.files_total > 0 {
+            (progress.files_done.saturating_mul(100) / progress.files_total) as u32
+        } else {
+            0
+        };
+        let bucket = percent / 10 * 10;
+        let phase_changed = match self.last_phase.lock() {
+            Ok(mut last) => {
+                if *last == progress.phase {
+                    false
+                } else {
+                    *last = progress.phase;
+                    true
+                }
+            }
+            Err(_) => false,
+        };
+        if !phase_changed && self.last_bucket.load(Ordering::Relaxed) == bucket {
+            return;
+        }
+        self.last_bucket.store(bucket, Ordering::Relaxed);
+        if progress.item.is_empty() {
+            cli_err(&format!("[{}] {}%", progress.phase.text(), percent));
+        } else {
+            cli_err(&format!("[{}] {}% {}", progress.phase.text(), percent, shorten_path(&progress.item, 70)));
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        CANCEL.load(Ordering::SeqCst)
+    }
+}
+
+/// Writes a line and ignores errors: a GUI-subsystem process may have no usable stdout.
+fn cli_out(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout(), "{}", line);
+    let _ = std::io::stdout().flush();
+}
+
+fn cli_err(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{}", line);
+    let _ = std::io::stderr().flush();
+}
+
+fn help_text() -> String {
+    let mut text = String::new();
+    text.push_str(&format!(
+        "Linkerino {}: переносит папку и оставляет на её месте символьную ссылку.\n",
+        env!("CARGO_PKG_VERSION")
+    ));
+    text.push('\n');
+    text.push_str("Без параметров открывается окно программы.\n\n");
+    text.push_str("Команды:\n");
+    text.push_str("  --transfer <папка> <куда>   перенести папку и оставить на старом месте ссылку\n");
+    text.push_str("  --plan <папка> <куда>       только проверить пути и показать итоговый путь\n");
+    text.push_str("  --journals                  показать незавершённые переносы\n");
+    text.push_str("  --version                   версия программы\n");
+    text.push_str("  --help                      эта справка\n\n");
+    text.push_str("Параметры:\n");
+    text.push_str("  --dry-run, -n               то же, что --plan; можно и без --transfer\n");
+    text.push_str("  --quiet, -q                 без строк прогресса\n");
+    text.push_str("  --json                      итог и ошибки одной JSON-строкой в stdout\n");
+    text.push_str("  --                          дальше только пути (если путь начинается с «-»)\n\n");
+    text.push_str(
+        "Коды возврата: 0 — успех, 1 — отказ или ошибка переноса, 2 — ошибка в параметрах,\n3 — отменено по Ctrl+C. Прогресс выводится в stderr.\n\n",
+    );
+    text.push_str("Служебные режимы для снимков окна: --screenshot <файл> [--demo] [--theme light|dark].\n");
+    text
+}
+
+fn print_help() {
+    cli_out(help_text().trim_end());
+}
+
+fn print_help_err() {
+    cli_err(help_text().trim_end());
+}
+
+/// Usage errors keep stdout machine-readable when `--json` was requested; the help goes to stderr.
+fn report_usage_error(args: &[String], message: &str) -> i32 {
+    if args.iter().any(|arg| arg == "--json") {
+        cli_out(&format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(message)));
+    }
+    cli_err(message);
+    print_help_err();
+    EXIT_USAGE
+}
+
+fn json_outcome(plan: &engine::Plan, outcome: &engine::Outcome) -> String {
+    format!(
+        "{{\"ok\":{},\"cancelled\":{},\"dest\":\"{}\",\"message\":\"{}\",\"detail\":\"{}\",\"notes\":\"{}\",\"leftover\":\"{}\"}}",
+        json_bool(outcome.ok),
+        json_bool(outcome.cancelled),
+        json_escape(&plan.dest_final),
+        json_escape(&outcome.message),
+        json_escape(&outcome.detail),
+        json_escape(outcome.notes.trim_end()),
+        json_escape(&outcome.leftover)
+    )
+}
+
+fn run_journals(json: bool) -> i32 {
+    let journals = engine::unfinished_journals();
+    if json {
+        let items: Vec<String> = journals
+            .iter()
+            .map(|path| format!("\"{}\"", json_escape(&path.to_string_lossy())))
+            .collect();
+        cli_out(&format!("{{\"count\":{},\"journals\":[{}]}}", journals.len(), items.join(",")));
+        return EXIT_OK;
+    }
+    if journals.is_empty() {
+        cli_out("Незавершённых переносов нет.");
+    } else {
+        cli_out(&format!("Незавершённые переносы: {}", journals.len()));
+        for path in &journals {
+            cli_out(&path.display().to_string());
+        }
+    }
+    EXIT_OK
+}
+
+fn run_plan(source: &str, dest: &str, flags: &CliFlags) -> i32 {
+    let plan = engine::build_plan(source, dest);
+    if !plan.valid {
+        if flags.json {
+            cli_out(&format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&plan.error)));
+        } else {
+            cli_err(&plan.error);
+        }
+        return EXIT_FAILED;
+    }
+    if flags.json {
+        cli_out(&format!(
+            "{{\"ok\":true,\"dry_run\":true,\"source\":\"{}\",\"dest\":\"{}\"}}",
+            json_escape(&plan.source),
+            json_escape(&plan.dest_final)
+        ));
+    } else {
+        cli_out("Проверка пройдена, перенос не выполнялся.");
+        cli_out(&format!("Откуда: {}", plan.source));
+        cli_out(&format!("Куда:   {}", plan.dest_final));
+    }
+    EXIT_OK
+}
+
+fn run_transfer(source: &str, dest: &str, flags: &CliFlags) -> i32 {
+    let plan = engine::build_plan(source, dest);
+    if !plan.valid {
+        if flags.json {
+            cli_out(&format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&plan.error)));
+        } else {
+            cli_err(&plan.error);
+        }
+        return EXIT_FAILED;
+    }
+    install_ctrl_c();
+    if !flags.quiet && !flags.json {
+        cli_err(&format!("Перенос: {} -> {}", plan.source, plan.dest_final));
+    }
+    let sink = CliSink::new(flags.quiet || flags.json);
+    let outcome = engine::execute(&plan, Some(&sink), &engine::Faults::default());
+    if flags.json {
+        cli_out(&json_outcome(&plan, &outcome));
+    } else {
+        cli_out(&outcome.message);
+        if !outcome.leftover.is_empty() {
+            cli_out(&format!("Остаток: {}", outcome.leftover));
+        }
+        if !outcome.notes.is_empty() {
+            cli_out(outcome.notes.trim_end());
+        }
+        if !outcome.ok && !outcome.detail.is_empty() {
+            cli_err(&outcome.detail);
+        }
+    }
+    if outcome.cancelled {
+        EXIT_CANCELLED
+    } else if outcome.ok {
+        EXIT_OK
+    } else {
+        EXIT_FAILED
     }
 }
 
 fn run_cli(args: &[String]) -> i32 {
-    if args.len() < 3 {
-        eprintln!("usage: Linkerino --transfer <source-folder> <destination-parent>");
-        return 2;
-    }
-    let plan = engine::build_plan(&args[1], &args[2]);
-    if !plan.valid {
-        eprintln!("{}", plan.error);
-        return 1;
-    }
-    let outcome = engine::execute(&plan, None, &engine::Faults::default());
-    let code = if outcome.ok {
-        println!("{}", outcome.message);
-        if !outcome.leftover.is_empty() {
-            println!("Сохранено: {}", outcome.leftover);
+    ensure_console();
+    let (command, flags) = match parse_cli(args) {
+        Ok(value) => value,
+        Err(error) => {
+            return report_usage_error(args, &error);
         }
-        0
-    } else {
-        eprintln!("{}", outcome.message);
-        if !outcome.detail.is_empty() {
-            eprintln!("{}", outcome.detail);
-        }
-        1
     };
-    if !outcome.notes.is_empty() {
-        println!("{}", outcome.notes.trim_end());
+    match command {
+        CliCommand::Help => {
+            print_help();
+            EXIT_OK
+        }
+        CliCommand::Version => {
+            cli_out(&format!("Linkerino {}", env!("CARGO_PKG_VERSION")));
+            EXIT_OK
+        }
+        CliCommand::Journals => run_journals(flags.json),
+        CliCommand::Plan { source, dest } => run_plan(&source, &dest, &flags),
+        CliCommand::Transfer { source, dest } => run_transfer(&source, &dest, &flags),
     }
-    code
 }
 
 fn window_icon() -> Option<egui::IconData> {
@@ -838,6 +1214,30 @@ fn window_icon() -> Option<egui::IconData> {
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--transfer"
+                | "/transfer"
+                | "--plan"
+                | "--journals"
+                | "--version"
+                | "-V"
+                | "--help"
+                | "-h"
+                | "/?"
+                | "--dry-run"
+                | "-n"
+                | "--json"
+                | "--quiet"
+                | "-q"
+        )
+    });
+    if cli {
+        let code = run_cli(&args);
+        std::process::exit(code);
+    }
+
     let mut screenshot: Option<PathBuf> = None;
     let mut demo = false;
     let mut demo_result = false;
@@ -846,19 +1246,6 @@ fn main() -> eframe::Result<()> {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--transfer" | "/transfer" => {
-                attach_console();
-                let code = run_cli(&args[index..]);
-                std::process::exit(code);
-            }
-            "--help" | "/?" | "-h" => {
-                attach_console();
-                println!("Linkerino: переносит папку и оставляет на её месте символьную ссылку.");
-                println!("  Linkerino.exe                             — графический интерфейс");
-                println!("  Linkerino.exe --transfer <папка> <куда>   — перенос без интерфейса");
-                println!("  Linkerino.exe --screenshot <файл> [--demo] [--theme light|dark] — снимок окна и выход");
-                std::process::exit(0);
-            }
             "--screenshot" => {
                 if index + 1 < args.len() {
                     screenshot = Some(PathBuf::from(&args[index + 1]));
@@ -877,6 +1264,11 @@ fn main() -> eframe::Result<()> {
             _ => {}
         }
         index += 1;
+    }
+    if screenshot.is_none() && !args.is_empty() {
+        ensure_console();
+        let message = format!("Неизвестные параметры: {}", args.join(" "));
+        std::process::exit(report_usage_error(&args, &message));
     }
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([560.0, 320.0])
@@ -913,5 +1305,60 @@ mod tests {
         assert_eq!(theme_from_key(Theme::Dark.key()), Theme::Dark);
         assert_eq!(theme_from_key(Theme::Light.key()), Theme::Light);
         assert_eq!(theme_from_key("DARK"), Theme::Dark);
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn transfer_parsing() {
+        let (command, flags) = parse_cli(&args(&["--transfer", "C:\\a", "D:\\b"])).unwrap();
+        assert_eq!(
+            command,
+            CliCommand::Transfer { source: "C:\\a".to_string(), dest: "D:\\b".to_string() }
+        );
+        assert!(!flags.json && !flags.quiet && !flags.dry_run);
+    }
+
+    #[test]
+    fn plan_and_dry_run_parsing() {
+        let (command, _) = parse_cli(&args(&["--plan", "a", "b"])).unwrap();
+        assert!(matches!(command, CliCommand::Plan { .. }));
+        let (command, flags) = parse_cli(&args(&["--transfer", "a", "b", "--dry-run", "--json", "-q"])).unwrap();
+        assert!(matches!(command, CliCommand::Plan { .. }));
+        assert!(flags.json && flags.quiet && flags.dry_run);
+        let (command, flags) = parse_cli(&args(&["--dry-run", "a", "b"])).unwrap();
+        assert!(matches!(command, CliCommand::Plan { .. }));
+        assert!(flags.dry_run);
+    }
+
+    #[test]
+    fn double_dash_keeps_dash_paths() {
+        let (command, _) = parse_cli(&args(&["--plan", "--", "-odd", "-dest"])).unwrap();
+        assert_eq!(
+            command,
+            CliCommand::Plan { source: "-odd".to_string(), dest: "-dest".to_string() }
+        );
+    }
+
+    #[test]
+    fn usage_errors() {
+        assert!(parse_cli(&args(&["--transfer", "only-one"])).is_err());
+        assert!(parse_cli(&args(&["--nonsense"])).is_err());
+        assert!(parse_cli(&args(&["--version", "extra"])).is_err());
+        assert!(parse_cli(&args(&[])).is_err());
+    }
+
+    #[test]
+    fn json_escaping() {
+        assert_eq!(json_escape("a\"b\\c\nd\te"), "a\\\"b\\\\c\\nd\\te");
+        assert_eq!(json_escape("Готово"), "Готово");
+        assert_eq!(json_escape("\u{1}"), "\\u0001");
     }
 }
