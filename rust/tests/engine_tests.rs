@@ -408,6 +408,35 @@ fn missing_object_in_copy_is_rejected() {
 }
 
 #[test]
+fn directory_with_large_index_moves() {
+    let root = temp_root();
+    require_symlinks(&root);
+    let source = root.join("src").join("Data");
+    let dest_parent = root.join("dest");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest_parent).unwrap();
+    // A directory index gets a non-zero size once it grows: it must not look like a source change.
+    let mut dir_size = 0;
+    for index in 0..600 {
+        write(&source.join(format!("entry-{:04}.txt", index)), b"x");
+        if index % 50 == 49 {
+            dir_size = win::file_info(&source.to_string_lossy(), false).map(|info| info.size).unwrap_or(0);
+            if dir_size != 0 {
+                break;
+            }
+        }
+    }
+    assert!(dir_size != 0, "directory size stayed zero, the regression would not be caught");
+    let plan = engine::build_plan(&source.to_string_lossy(), &dest_parent.to_string_lossy());
+    assert!(plan.valid, "{}", plan.error);
+    let outcome = engine::execute(&plan, None, &Faults::default());
+    assert!(outcome.ok, "{} / {}", outcome.message, outcome.detail);
+    assert!(link_points_to(&source, Path::new(&plan.dest_final)));
+    assert!(read(&source.join("entry-0000.txt")) == b"x");
+    cleanup(&root);
+}
+
+#[test]
 fn only_interrupted_journals_need_attention() {
     init_journals();
     let dir = PathBuf::from(std::env::var("LINKERINO_JOURNAL_DIR").unwrap());

@@ -437,6 +437,7 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>) -> Resu
         is_dir: true,
         attrs: info.attrs,
         links: info.links,
+        size: info.size,
         created: info.created,
         modified: info.modified,
         serial: info.serial,
@@ -1058,8 +1059,9 @@ fn verify_source_unchanged(plan: &Plan, entries: &[Entry]) -> Result<(), String>
             continue;
         }
         let info = win::file_info(&plain, false).ok_or_else(|| format!("Не удалось прочитать {}", plain))?;
+        // A directory's size is the size of its index, not data: only files are compared by size.
         if (info.attrs & win::FILE_ATTRIBUTE_DIRECTORY != 0) != entry.is_dir
-            || info.size != entry.size
+            || (!entry.is_dir && info.size != entry.size)
             || info.serial != entry.serial
             || info.index != entry.index
             || info.links != entry.links
