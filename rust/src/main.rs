@@ -470,10 +470,29 @@ impl App {
         }
     }
 
+    /// Where the folder dialog should open: one level above the path that is already typed in the
+    /// field, so the next choice starts next to the current one instead of wherever the previous
+    /// dialog was left. A path that no longer exists falls back to its nearest existing ancestor.
+    fn browse_start(value: &str) -> Option<PathBuf> {
+        let text = value.trim().trim_matches('"').trim();
+        if text.is_empty() {
+            return None;
+        }
+        let mut candidate = PathBuf::from(text).parent()?.to_path_buf();
+        while !candidate.is_dir() {
+            candidate = candidate.parent()?.to_path_buf();
+        }
+        Some(candidate)
+    }
+
     /// `None` — the dialog was cancelled; `Some(Err(..))` — the chosen name cannot be read as
     /// Unicode, so it must not be silently replaced by a similar-looking path.
-    fn browse(title: &str) -> Option<Result<String, String>> {
-        rfd::FileDialog::new().set_title(title).pick_folder().map(|picked: PathBuf| match picked.to_str() {
+    fn browse(title: &str, start: Option<PathBuf>) -> Option<Result<String, String>> {
+        let mut dialog = rfd::FileDialog::new().set_title(title);
+        if let Some(folder) = start {
+            dialog = dialog.set_directory(folder);
+        }
+        dialog.pick_folder().map(|picked: PathBuf| match picked.to_str() {
             Some(value) => Ok(value.to_string()),
             None => Err("В имени выбранной папки есть символы, которые нельзя прочитать как Unicode.".to_string()),
         })
@@ -579,7 +598,8 @@ impl App {
                             egui::Button::new(egui::RichText::new("Обзор…").size(11.0)),
                         );
                         if button.clicked() {
-                            match App::browse("Выберите папку") {
+                            let start = App::browse_start(value);
+                            match App::browse("Выберите папку", start) {
                                 Some(Ok(picked)) => {
                                     *value = picked;
                                     changed = true;
@@ -1626,5 +1646,33 @@ mod args_tests {
         );
         assert!(bad);
         assert_eq!(kept, vec!["--json".to_string(), "--plan".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod browse_tests {
+    use super::*;
+
+    #[test]
+    fn browse_opens_next_to_the_current_path() {
+        let root = std::env::temp_dir().join(format!("linkerino-browse-{}", std::process::id()));
+        let nested = root.join("Games").join("Example");
+        std::fs::create_dir_all(&nested).expect("create");
+        // A folder in the field: the dialog starts one level above it.
+        let start = App::browse_start(&nested.to_string_lossy()).expect("start");
+        assert_eq!(start, root.join("Games"));
+        // Quotes and spaces around the value are tolerated.
+        let quoted = format!("  \"{}\"  ", nested.to_string_lossy());
+        let start = App::browse_start(&quoted).expect("start");
+        assert_eq!(start, root.join("Games"));
+        // A path that no longer exists falls back to the nearest existing ancestor.
+        let missing = root.join("gone").join("Example");
+        let start = App::browse_start(&missing.to_string_lossy()).expect("start");
+        assert_eq!(start, root);
+        // An empty field leaves the dialog at its default place.
+        assert!(App::browse_start("   ").is_none());
+        // A drive root has no parent: the dialog keeps its default place instead of failing.
+        assert!(App::browse_start("C:\\").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
