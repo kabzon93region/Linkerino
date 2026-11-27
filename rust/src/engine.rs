@@ -524,11 +524,12 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>, ctx: &m
                 .map_err(|code| format!("Не удалось прочитать ссылку {}: {}", child_plain, win::error_text(code)))?;
             let target_text = win::normalize_target(&reparse.substitute);
             // A link that points into the folder is recreated against the new location; any other
-            // link keeps its own target text. Only a relative link has to be resolved to decide.
+            // link keeps its own target text. The target is resolved so a short 8.3 path and a long
+            // path to the same folder are recognised as one place, not as two.
             let resolved = if reparse.relative {
                 win::canonical(&child_plain).unwrap_or_default()
             } else {
-                target_text.clone()
+                win::canonical(&target_text).unwrap_or_else(|| target_text.clone())
             };
             let inside_root = !resolved.is_empty()
                 && (same_path(&resolved, root) || under_or_equal(&resolved, root));
