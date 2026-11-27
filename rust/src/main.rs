@@ -158,7 +158,7 @@ struct App {
     rx: Option<Receiver<Msg>>,
     confirm: Option<engine::Plan>,
     result: Option<engine::Outcome>,
-    journals: Vec<String>,
+    journals: Vec<engine::JournalSummary>,
     screenshot: Option<PathBuf>,
     screenshot_requested: bool,
     frames: u32,
@@ -247,8 +247,7 @@ impl App {
         let theme = theme_override.unwrap_or_else(load_theme);
         let palette = Palette::of(theme);
 
-        let journals: Vec<String> =
-            engine::unfinished_journals().iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let journals: Vec<engine::JournalSummary> = engine::unfinished_journals();
         let mut app = App {
             source: String::new(),
             dest: String::new(),
@@ -295,7 +294,16 @@ impl App {
             app.dest = "E:\\Backup".to_string();
             app.preview = "E:\\Backup\\Example".to_string();
             app.journals = (1..=140)
-                .map(|index| format!("D:\\Backup\\Linkerino\\journal-example-{:08x}.txt", index))
+                .map(|index| engine::JournalSummary {
+                    path: std::path::PathBuf::from(format!(
+                        "D:\\Backup\\Linkerino\\journal-example-{:08x}.txt",
+                        index
+                    )),
+                    state: "linked".to_string(),
+                    source: format!("D:\\Games\\Example{}", index),
+                    dest: format!("E:\\Backup\\Example{}", index),
+                    backup: format!("D:\\Games\\.linkerino-backup-{:08x}", index),
+                })
                 .collect();
         }
         app
@@ -739,37 +747,39 @@ impl eframe::App for App {
             let mut close = ctx.input(|input| input.key_pressed(egui::Key::Escape));
             let count = self.journals.len();
             let title = if count == 1 {
-                "Незавершённый перенос".to_string()
+                "Требует внимания".to_string()
             } else {
-                format!("Незавершённые переносы: {}", count)
+                format!("Требуют внимания: {}", count)
             };
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.label("Проверьте эти папки вручную — перенос мог остановиться на середине:");
+                    ui.label("Проверьте эти папки: перенос мог остановиться, а старый экземпляр — остаться:");
                     ui.add_space(4.0);
-                    egui::ScrollArea::vertical().max_height(150.0).auto_shrink([false, false]).show(ui, |ui| {
-                        for path in self.journals.iter().take(100) {
+                    egui::ScrollArea::vertical().max_height(146.0).auto_shrink([false, false]).show(ui, |ui| {
+                        for journal in self.journals.iter().take(100) {
+                            let text = if journal.source.is_empty() {
+                                journal.state_text().to_string()
+                            } else {
+                                format!("{} — {}", journal.state_text(), shorten_path(&journal.source, 58))
+                            };
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(text).monospace().size(10.5)).truncate(),
+                            );
+                        }
+                        if count > 100 {
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(shorten_path(path, 74)).monospace().size(10.5),
+                                    egui::RichText::new(format!("Показаны первые 100, всего {}", count))
+                                        .size(10.5)
+                                        .color(self.palette.muted),
                                 )
                                 .truncate(),
                             );
                         }
                     });
-                    if count > 100 {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("Показаны первые 100, всего {}", count))
-                                    .size(10.5)
-                                    .color(self.palette.muted),
-                            )
-                            .truncate(),
-                        );
-                    }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Понятно").clicked() {
@@ -779,7 +789,7 @@ impl eframe::App for App {
                             let folder = self
                                 .journals
                                 .first()
-                                .and_then(|path| std::path::Path::new(path).parent().map(|p| p.to_path_buf()));
+                                .and_then(|journal| journal.path.parent().map(|p| p.to_path_buf()));
                             if let Some(folder) = folder {
                                 let _ = std::process::Command::new("explorer.exe").arg(folder).spawn();
                             }
@@ -1054,7 +1064,7 @@ fn help_text() -> String {
     text.push_str("Команды:\n");
     text.push_str("  --transfer <папка> <куда>   перенести папку и оставить на старом месте ссылку\n");
     text.push_str("  --plan <папка> <куда>       только проверить пути и показать итоговый путь\n");
-    text.push_str("  --journals                  показать незавершённые переносы\n");
+    text.push_str("  --journals                  показать записи, требующие внимания\n");
     text.push_str("  --version                   версия программы\n");
     text.push_str("  --help                      эта справка\n\n");
     text.push_str("Параметры:\n");
@@ -1105,17 +1115,36 @@ fn run_journals(json: bool) -> i32 {
     if json {
         let items: Vec<String> = journals
             .iter()
-            .map(|path| format!("\"{}\"", json_escape(&path.to_string_lossy())))
+            .map(|journal| {
+                format!(
+                    "{{\"path\":\"{}\",\"state\":\"{}\",\"source\":\"{}\",\"dest\":\"{}\",\"backup\":\"{}\"}}",
+                    json_escape(&journal.path.display().to_string()),
+                    json_escape(&journal.state),
+                    json_escape(&journal.source),
+                    json_escape(&journal.dest),
+                    json_escape(&journal.backup)
+                )
+            })
             .collect();
         cli_out(&format!("{{\"count\":{},\"journals\":[{}]}}", journals.len(), items.join(",")));
         return EXIT_OK;
     }
     if journals.is_empty() {
-        cli_out("Незавершённых переносов нет.");
+        cli_out("Нет записей, требующих внимания.");
     } else {
-        cli_out(&format!("Незавершённые переносы: {}", journals.len()));
-        for path in &journals {
-            cli_out(&path.display().to_string());
+        cli_out(&format!("Требуют внимания: {}", journals.len()));
+        for journal in &journals {
+            cli_out(&format!("{} [{}]", journal.path.display(), journal.state));
+            cli_out(&format!("  {}", journal.state_text()));
+            if !journal.source.is_empty() {
+                cli_out(&format!("  откуда: {}", journal.source));
+            }
+            if !journal.dest.is_empty() {
+                cli_out(&format!("  куда: {}", journal.dest));
+            }
+            if !journal.backup.is_empty() {
+                cli_out(&format!("  резерв: {}", journal.backup));
+            }
         }
     }
     EXIT_OK

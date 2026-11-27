@@ -1,6 +1,6 @@
 [package]
 name = "linkerino"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2021"
 description = "Move a folder to another disk and replace it with a directory symlink"
 license = "MIT"
@@ -25,6 +25,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Console",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Globalization",
     "Win32_System_IO",
     "Win32_System_SystemInformation",
     "Win32_System_Diagnostics_Debug",

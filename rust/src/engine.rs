@@ -65,6 +65,9 @@ pub trait Sink {
 #[derive(Clone, Default)]
 pub struct Faults {
     pub copy_failure: bool,
+    /// Fails right after a file was created and before its data is written, to prove that the
+    /// object is already registered for cleanup.
+    pub copy_failure_after_create: bool,
     pub verify_mismatch: bool,
     pub link_failure: bool,
     pub low_space: bool,
@@ -84,6 +87,10 @@ pub struct Plan {
     pub dest_final: String,
     pub staging: String,
     pub backup: String,
+    /// Identity captured when the plan was approved: `execute` refuses to run on another object
+    /// that merely happens to sit at the same path.
+    pub source_id: win::ObjectId,
+    pub dest_parent_id: win::ObjectId,
 }
 
 #[derive(Clone, Default)]
@@ -127,6 +134,9 @@ struct Entry {
     serial: u64,
     index: u64,
     dacl: Option<String>,
+    /// True when the object carries ACEs that were set explicitly, not inherited. Losing those on
+    /// a filesystem without ACLs changes who can read the data, so it is treated as a real change.
+    dacl_explicit: bool,
     streams: Vec<StreamInfo>,
     hash: Option<String>,
     reparse: Option<ReparseLink>,
@@ -136,6 +146,7 @@ struct Entry {
 #[derive(Clone, Default)]
 struct Caps {
     fs: String,
+    /// True for a network share: the local write-through guarantee does not cover the server cache.
     remote: bool,
     acl: bool,
     streams: bool,
@@ -168,24 +179,29 @@ fn trim_input(value: &str) -> String {
 }
 
 fn same_path(left: &str, right: &str) -> bool {
-    left.eq_ignore_ascii_case(right)
+    win::equal_paths(path_key(left), path_key(right))
+}
+
+/// Paths are compared without a trailing separator, but a drive root keeps its form.
+fn path_key(value: &str) -> &str {
+    let mut text = value;
+    while text.len() > 3 && text.ends_with('\\') {
+        text = &text[..text.len() - 1];
+    }
+    text
 }
 
 fn under_or_equal(child: &str, parent: &str) -> bool {
     if parent.is_empty() || child.is_empty() {
         return false;
     }
+    let child = path_key(child);
+    let parent = path_key(parent);
     if same_path(child, parent) {
         return true;
     }
-    let mut prefix = parent.to_string();
-    if !prefix.ends_with('\\') {
-        prefix.push('\\');
-    }
-    if child.len() <= prefix.len() {
-        return false;
-    }
-    child[..prefix.len()].eq_ignore_ascii_case(&prefix)
+    // Byte slices only: cutting a UTF-8 string at a byte index used to panic on wide characters.
+    win::under_prefix(child, parent)
 }
 
 fn critical_dirs() -> Vec<String> {
@@ -319,6 +335,20 @@ pub fn build_plan(source_input: &str, dest_input: &str) -> Plan {
     plan.dest_final = dest_final.clone();
     plan.staging = win::join(&dest_parent, &format!(".linkerino-stage-{}", guid()));
     plan.backup = win::join(&plan.source_parent.clone(), &format!(".linkerino-backup-{}", guid()));
+    // Remember which objects the user confirmed. `execute` compares these ids again, so a folder
+    // that was replaced at the same path after the preview is never touched.
+    let Some(source_info) = win::file_info(&source, true) else {
+        plan.valid = false;
+        plan.error = format!("Не удалось прочитать исходную папку: {}", source);
+        return plan;
+    };
+    let Some(dest_info) = win::file_info(&dest_parent, true) else {
+        plan.valid = false;
+        plan.error = format!("Не удалось прочитать папку назначения: {}", dest_parent);
+        return plan;
+    };
+    plan.source_id = source_info.id();
+    plan.dest_parent_id = dest_info.id();
     plan
 }
 
@@ -424,9 +454,12 @@ fn copy_stream(source: &str, target: &str, ctx: &mut Ctx) -> std::io::Result<Str
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>) -> Result<(), String> {
+fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>, ctx: &mut Ctx) -> Result<(), String> {
     if depth > 512 {
         return Err(format!("Слишком глубокая вложенность каталогов: {}", rel));
+    }
+    if ctx.cancel_requested() {
+        return Err("Отменено пользователем".into());
     }
     let plain = if rel.is_empty() { root.to_string() } else { win::join(root, rel) };
     let Some(info) = win::file_info(&plain, false) else {
@@ -443,6 +476,7 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>) -> Resu
         serial: info.serial,
         index: info.index,
         dacl: win::acl_signature(&plain),
+        dacl_explicit: win::acl_has_explicit(&plain).unwrap_or(true),
         ..Default::default()
     };
     dir.streams = win::streams(&plain)
@@ -462,7 +496,15 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>) -> Resu
     };
     for item in read_dir {
         let item = item.map_err(|e| format!("Ошибка чтения {}: {}", plain, e))?;
-        let name = item.file_name().to_string_lossy().to_string();
+        // A lossy conversion would silently rename the object in the copy; refuse instead.
+        let name = item
+            .file_name()
+            .to_str()
+            .map(|value| value.to_string())
+            .ok_or_else(|| format!("В {} есть имя, которое нельзя прочитать как Unicode. Перенос отменён.", plain))?;
+        if ctx.cancel_requested() {
+            return Err("Отменено пользователем".into());
+        }
         let child_rel = if rel.is_empty() { name.clone() } else { win::join(rel, &name) };
         let child_plain = win::join(&plain, &name);
         let Some(attrs) = win::attributes(&child_plain) else {
@@ -478,7 +520,13 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>) -> Resu
             let is_dir = attrs & win::FILE_ATTRIBUTE_DIRECTORY != 0;
             let reparse = win::read_reparse(&child_plain)
                 .map_err(|code| format!("Не удалось прочитать ссылку {}: {}", child_plain, win::error_text(code)))?;
-            let resolved = win::canonical(&child_plain).unwrap_or_default();
+            // Resolve only a relative link: an absolute link keeps its own target text and its
+            // destination is never opened while scanning.
+            let resolved = if reparse.relative {
+                win::canonical(&child_plain).unwrap_or_default()
+            } else {
+                String::new()
+            };
             let inside_rel = if !resolved.is_empty() && under_or_equal(&resolved, root) {
                 resolved[root.len()..].trim_start_matches('\\').to_string()
             } else {
@@ -511,7 +559,7 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>) -> Resu
             continue;
         }
         if attrs & win::FILE_ATTRIBUTE_DIRECTORY != 0 {
-            scan_dir(root, &child_rel, depth + 1, entries)?;
+            scan_dir(root, &child_rel, depth + 1, entries, ctx)?;
             continue;
         }
         let Some(info) = win::file_info(&child_plain, false) else {
@@ -528,6 +576,7 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>) -> Resu
             serial: info.serial,
             index: info.index,
             dacl: win::acl_signature(&child_plain),
+            dacl_explicit: win::acl_has_explicit(&child_plain).unwrap_or(true),
             ..Default::default()
         };
         file.streams = win::streams(&child_plain)
@@ -615,9 +664,10 @@ fn probe_caps(parent: &str) -> Result<Caps, String> {
         }
         let _ = win::delete_dir(&probe_dir);
     }
-    // ACL: set a protected NULL DACL, read it back, restore.
+    // ACL: copy the parent DACL onto the probe file and read it back. The probe never widens
+    // access: a NULL (allow-everyone) DACL is never used, not even temporarily.
     if info.remote || fs_name.eq_ignore_ascii_case("ReFS") {
-        caps.acl = probe_acl(&probe_file);
+        caps.acl = probe_acl(&probe_file, parent);
     }
     // Hard links.
     let link_probe = format!("{}.link", probe_file);
@@ -644,38 +694,15 @@ fn probe_caps(parent: &str) -> Result<Caps, String> {
     Ok(caps)
 }
 
-fn probe_acl(path: &str) -> bool {
-    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SetNamedSecurityInfoW};
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION};
-    let mut name = win::api(path);
-    let mut original: win::Pacl = std::ptr::null_mut();
-    let mut descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    let read = unsafe {
-        GetNamedSecurityInfoW(name.as_ptr(), crate::win::SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-                              std::ptr::null_mut(), std::ptr::null_mut(), &mut original, std::ptr::null_mut(),
-                              &mut descriptor)
-    };
-    if read != 0 {
+/// Checks that a DACL survives a copy on this filesystem, using the parent folder's own DACL as
+/// the sample: no permissive placeholder is ever written, so a failed probe cannot widen access.
+fn probe_acl(probe: &str, parent: &str) -> bool {
+    if !win::apply_acl(parent, probe) {
         return false;
     }
-    let set_null = unsafe {
-        SetNamedSecurityInfoW(name.as_mut_ptr(), crate::win::SE_FILE_OBJECT,
-                              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                              std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
-    };
-    if set_null != 0 {
-        unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor as *mut _) };
-        return false;
-    }
-    let applied = win::acl_signature(path).map(|s| s == "<null>").unwrap_or(false) && win::dacl_protected(path);
-    // Put the original DACL back: the probe file is temporary, but it must not keep a NULL DACL.
-    unsafe {
-        SetNamedSecurityInfoW(name.as_mut_ptr(), crate::win::SE_FILE_OBJECT,
-                              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                              std::ptr::null_mut(), std::ptr::null_mut(), original, std::ptr::null_mut());
-        windows_sys::Win32::Foundation::LocalFree(descriptor as *mut _);
-    }
-    applied
+    let Some(expected) = win::acl_signature(parent) else { return false };
+    let applied = win::acl_signature(probe).map(|value| value == expected).unwrap_or(false);
+    applied && win::dacl_protected(probe)
 }
 
 fn attribute_mask_match(actual: u32, expected: u32, mask: u32) -> bool {
@@ -686,32 +713,57 @@ fn times_match(actual: u64, expected: u64, tolerance_ms: u64) -> bool {
     actual.abs_diff(expected) <= tolerance_ms * 10_000
 }
 
-fn copy_file(source: &str, target: &str, entry: &mut Entry, ctx: &mut Ctx, caps: &Caps) -> Result<(), String> {
+fn copy_file(
+    source: &str,
+    target: &str,
+    entry: &mut Entry,
+    ctx: &mut Ctx,
+    caps: &Caps,
+    created: &mut std::collections::HashSet<win::ObjectId>,
+    faults: &Faults,
+) -> Result<(), String> {
     let file = File::open(source).map_err(|e| format!("Не удалось открыть {}: {}", source, e))?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)
-        .map_err(|e| format!("Не удалось создать {}: {}", target, e))?;
+    // No sharing: while the data is being written nothing else can open the new file, so the
+    // inherited (possibly wider) rights never expose a half-written copy.
+    let guard = match win::Guard::open_new(target, caps.acl) {
+        Ok(value) => value,
+        Err(code) => return Err(format!("Не удалось создать {}: {}", target, win::error_text(code))),
+    };
+    // Registered right after creation: a failure below must still be able to clean this object up.
+    let created_id = guard.id().ok_or_else(|| format!("Не удалось подтвердить {}", target))?;
+    created.insert(created_id);
+    if faults.copy_failure_after_create {
+        return Err("Тестовый сбой после создания файла".into());
+    }
     let mut hasher = Sha256::new();
     let mut reader = std::io::BufReader::new(file);
     let mut buffer = vec![0u8; 1 << 20];
-    loop {
-        let read = reader.read(&mut buffer).map_err(|e| format!("Ошибка чтения {}: {}", source, e))?;
-        if read == 0 {
-            break;
+    {
+        let mut output = guard.as_file();
+        loop {
+            let read = reader.read(&mut buffer).map_err(|e| format!("Ошибка чтения {}: {}", source, e))?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read]).map_err(|e| format!("Ошибка записи {}: {}", target, e))?;
+            hasher.update(&buffer[..read]);
+            ctx.bytes_done += read as u64;
+            ctx.report(false);
+            if ctx.cancel_requested() {
+                return Err("Отменено пользователем".into());
+            }
         }
-        output.write_all(&buffer[..read]).map_err(|e| format!("Ошибка записи {}: {}", target, e))?;
-        hasher.update(&buffer[..read]);
-        ctx.bytes_done += read as u64;
-        ctx.report(false);
-        if ctx.cancel_requested() {
-            return Err("Отменено пользователем".into());
-        }
+        output.sync_all().map_err(|e| format!("Не удалось сбросить данные {}: {}", target, e))?;
     }
-    output.sync_all().map_err(|e| format!("Не удалось сбросить данные {}: {}", target, e))?;
-    drop(output);
     entry.hash = Some(format!("{:x}", hasher.finalize()));
+    // Rights and dates are applied through the same exclusive handle, before it is closed.
+    if caps.acl && !guard.set_dacl_from(source) {
+        return Err(format!("Не удалось сохранить права доступа для {}", target));
+    }
+    if !guard.set_basic(entry.created, entry.modified, entry.modified, Some(entry.attrs & caps.attr_mask)) {
+        return Err(format!("Не удалось сохранить даты и атрибуты {}", target));
+    }
+    drop(guard);
     if caps.streams {
         for stream in entry.streams.iter_mut() {
             let source_stream = stream_path(source, &stream.name);
@@ -719,30 +771,37 @@ fn copy_file(source: &str, target: &str, entry: &mut Entry, ctx: &mut Ctx, caps:
             stream.hash = copy_stream(&source_stream, &target_stream, ctx)
                 .map_err(|e| format!("Ошибка копирования потока {}: {}", source_stream, e))?;
         }
-    }
-    if caps.acl && !win::apply_acl(source, target) {
-        return Err(format!("Не удалось сохранить права доступа для {}", target));
-    }
-    if !win::set_times(target, entry.created, entry.modified, entry.modified) {
-        return Err(format!("Не удалось сохранить даты {}", target));
-    }
-    let attrs = entry.attrs & caps.attr_mask;
-    if !win::set_attributes(target, attrs) {
-        return Err(format!("Не удалось сохранить атрибуты {}", target));
+        // Writing a stream changes the modification time, so the recorded one is restored again.
+        if !win::set_times(target, entry.created, entry.modified, entry.modified) {
+            return Err(format!("Не удалось сохранить даты {}", target));
+        }
     }
     Ok(())
 }
 
-fn copy_reparse(target: &str, link: &ReparseLink) -> Result<(), String> {
+fn copy_reparse(
+    target: &str,
+    link: &ReparseLink,
+    created: &mut std::collections::HashSet<win::ObjectId>,
+) -> Result<(), String> {
     if link.tag == 0xA000000C {
         win::symlink(target, &link.link_text, link.is_dir)
             .map_err(|code| format!("Не удалось создать ссылку {}: {}", target, win::error_text(code)))?;
+        match win::object_id(target, true) {
+            Some(id) => created.insert(id),
+            None => return Err(format!("Не удалось подтвердить ссылку {}", target)),
+        };
         return Ok(());
     }
     if link.tag == 0xA0000003 {
-        if !win::create_dir(target) {
+        if !win::create_dir_new(target) {
             return Err(format!("Не удалось создать каталог для junction {}", target));
         }
+        // Registered before the reparse data is written, so a failure below can still clean up.
+        match win::object_id(target, true) {
+            Some(id) => created.insert(id),
+            None => return Err(format!("Не удалось подтвердить каталог junction {}", target)),
+        };
         if !win::write_junction(target, &link.raw) {
             return Err(format!("Не удалось создать junction {}", target));
         }
@@ -751,15 +810,34 @@ fn copy_reparse(target: &str, link: &ReparseLink) -> Result<(), String> {
     Err(format!("Неподдерживаемый тип ссылки: {}", target))
 }
 
-fn copy_tree(plan: &Plan, entries: &mut [Entry], ctx: &mut Ctx, faults: &Faults, caps: &Caps) -> Result<(), String> {
+fn copy_tree(
+    plan: &Plan,
+    entries: &mut [Entry],
+    ctx: &mut Ctx,
+    faults: &Faults,
+    caps: &Caps,
+    created: &mut std::collections::HashSet<win::ObjectId>,
+) -> Result<(), String> {
     for index in 0..entries.len() {
+        if ctx.cancel_requested() {
+            return Err("Отменено пользователем".into());
+        }
         if !entries[index].is_dir || entries[index].reparse.is_some() {
             continue;
         }
         let rel = entries[index].rel.clone();
         let target = if rel.is_empty() { plan.staging.clone() } else { win::join(&plan.staging, &rel) };
-        if !win::create_dir(&target) {
-            return Err(format!("Не удалось создать каталог {}", target));
+        // An object that already exists is never accepted: the copy must consist of new objects only.
+        // The staging root itself was created and identified by `execute`, so it is reused as is.
+        if !rel.is_empty() {
+            if !win::create_dir_new(&target) {
+                return Err(format!("Не удалось создать каталог {}", target));
+            }
+            // Remember exactly which objects this operation created: cleanup may delete only these.
+            match win::object_id(&target, true) {
+                Some(id) => { created.insert(id); }
+                None => return Err(format!("Не удалось подтвердить каталог {}", target)),
+            }
         }
         if caps.acl {
             let source = if rel.is_empty() { plan.source.clone() } else { win::join(&plan.source, &rel) };
@@ -784,7 +862,7 @@ fn copy_tree(plan: &Plan, entries: &mut [Entry], ctx: &mut Ctx, faults: &Faults,
         let target = win::join(&plan.staging, &entries[index].rel);
         ctx.item = entries[index].rel.clone();
         ctx.report(true);
-        copy_reparse(&target, &link)?;
+        copy_reparse(&target, &link, created)?;
     }
     for index in 0..entries.len() {
         if entries[index].is_dir || entries[index].reparse.is_some() {
@@ -812,9 +890,15 @@ fn copy_tree(plan: &Plan, entries: &mut [Entry], ctx: &mut Ctx, faults: &Faults,
         }
         if !handled {
             let mut copy = entries[index].clone();
-            copy_file(&source, &target, &mut copy, ctx, caps)?;
+            copy_file(&source, &target, &mut copy, ctx, caps, created, faults)?;
             entries[index].hash = copy.hash.clone();
             entries[index].streams = copy.streams.clone();
+        } else {
+            // A hard link is a new name for an object that is already tracked; remember the name's
+            // own identity as well so the cleanup can recognise it.
+            if let Some(id) = win::object_id(&target, true) {
+                created.insert(id);
+            }
         }
         ctx.files_done += 1;
         ctx.report(true);
@@ -1080,136 +1164,358 @@ fn verify_source_unchanged(plan: &Plan, entries: &[Entry]) -> Result<(), String>
     Ok(())
 }
 
-fn journal_dir() -> Option<std::path::PathBuf> {
-    if let Ok(custom) = std::env::var("LINKERINO_JOURNAL_DIR") {
-        if !custom.trim().is_empty() {
-            let path = Path::new(custom.trim()).to_path_buf();
-            let _ = fs::create_dir_all(&path);
-            return Some(path);
+fn journal_root(create: bool) -> Option<std::path::PathBuf> {
+    let path = match std::env::var("LINKERINO_JOURNAL_DIR") {
+        Ok(custom) if !custom.trim().is_empty() => Path::new(custom.trim()).to_path_buf(),
+        _ => Path::new(&std::env::var("LOCALAPPDATA").ok()?).join("Linkerino"),
+    };
+    if create {
+        fs::create_dir_all(&path).ok()?;
+        return Some(path);
+    }
+    // "No folder yet" and "cannot look inside" are different answers: only a missing folder means
+    // there is nothing to report.
+    match fs::metadata(&path) {
+        Ok(meta) if meta.is_dir() => Some(path),
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(path),
+    }
+}
+
+/// Recovery record of one transfer. Every field that a person would need to finish or undo the
+/// operation by hand is stored here, and every update is atomic and durable.
+struct Journal {
+    id: String,
+    source: String,
+    source_id: win::ObjectId,
+    dest: String,
+    dest_id: Option<win::ObjectId>,
+    staging: String,
+    backup: String,
+    files: u64,
+}
+
+fn escape_value(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            _ => result.push(character),
         }
     }
-    let base = std::env::var("LOCALAPPDATA").ok().map(|v| format!("{}\\Linkerino", v))?;
-    let _ = fs::create_dir_all(&base);
-    Some(Path::new(&base).to_path_buf())
+    result
 }
 
-fn journal_path(id: &str) -> Option<std::path::PathBuf> {
-    Some(journal_dir()?.join(format!("journal-{}.txt", id)))
-}
-
-fn write_journal(id: &str, plan: &Plan, state: &str, extra: &str) {
-    let Some(path) = journal_path(id) else { return };
-    let content = format!(
-        "state={}\nsource={}\ndest={}\nstaging={}\nbackup={}\n{}\n",
-        state, plan.source, plan.dest_final, plan.staging, plan.backup, extra
-    );
-    let _ = fs::write(path, content);
-}
-
-fn remove_journal(id: &str) {
-    if let Some(path) = journal_path(id) {
-        let _ = fs::remove_file(path);
-    }
-}
-
-fn remove_tree(path: &str) -> bool {
-    let Some(attrs) = win::attributes(path) else { return true };
-    if attrs & win::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return win::delete_dir(path) || win::delete_file(path);
-    }
-    if attrs & win::FILE_ATTRIBUTE_DIRECTORY != 0 {
-        if let Ok(read_dir) = fs::read_dir(path) {
-            for item in read_dir.flatten() {
-                let child = item.path().to_string_lossy().to_string();
-                if !remove_tree(&child) {
-                    return false;
-                }
-            }
+fn unescape_value(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            result.push(character);
+            continue;
         }
-        return win::delete_dir(path);
+        match characters.next() {
+            Some('n') => result.push('\n'),
+            Some('r') => result.push('\r'),
+            Some(other) => result.push(other),
+            None => result.push('\\'),
+        }
     }
-    if attrs & win::FILE_ATTRIBUTE_READONLY != 0 {
-        let _ = win::set_attributes(path, attrs & !win::FILE_ATTRIBUTE_READONLY);
-    }
-    win::delete_file(path)
+    result
 }
 
-fn delete_backup(plan: &Plan, entries: &[Entry], dest_serial: u64, dest_index: u64) -> Result<(), (String, String)> {
-    let mut processed = 0usize;
-    for entry in entries.iter().rev() {
-        if processed % 32 == 0 {
-            if !link_still_valid(&plan.source, &plan.dest_final, dest_serial, dest_index) {
-                return Err((format!("Ссылка на новое место перестала быть доступной: {}", plan.source), plan.backup.clone()));
-            }
+fn id_text(id: win::ObjectId) -> String {
+    format!("{:x}:{:x}", id.serial, id.index)
+}
+
+impl Journal {
+    fn new(plan: &Plan) -> Journal {
+        Journal {
+            id: guid(),
+            source: plan.source.clone(),
+            source_id: plan.source_id,
+            dest: plan.dest_final.clone(),
+            dest_id: None,
+            staging: plan.staging.clone(),
+            backup: plan.backup.clone(),
+            files: 0,
         }
-        processed += 1;
-        let plain = if entry.rel.is_empty() { plan.backup.clone() } else { win::join(&plan.backup, &entry.rel) };
-        let Some(attrs) = win::attributes(&plain) else {
-            return Err((format!("Объект резерва исчез: {}", plain), plain));
+    }
+
+    fn file_name(&self) -> String {
+        format!("journal-{}.txt", self.id)
+    }
+
+    fn text(&self, state: &str, note: &str) -> String {
+        let mut text = String::new();
+        text.push_str("version=3\n");
+        text.push_str(&format!("id={}\n", escape_value(&self.id)));
+        text.push_str(&format!("state={}\n", escape_value(state)));
+        text.push_str(&format!("source={}\n", escape_value(&self.source)));
+        text.push_str(&format!("sourceid={}\n", id_text(self.source_id)));
+        text.push_str(&format!("dest={}\n", escape_value(&self.dest)));
+        text.push_str(&format!(
+            "destid={}\n",
+            self.dest_id.map(id_text).unwrap_or_default()
+        ));
+        text.push_str(&format!("staging={}\n", escape_value(&self.staging)));
+        text.push_str(&format!("backup={}\n", escape_value(&self.backup)));
+        text.push_str(&format!("files={}\n", self.files));
+        text.push_str(&format!("note={}\n", escape_value(note)));
+        text
+    }
+
+    /// Writes the record through a temporary file and a write-through rename, so a reader never
+    /// sees a half-written journal and a power loss cannot leave the old state behind.
+    fn save(&self, state: &str, note: &str) -> Result<(), String> {
+        let Some(dir) = journal_root(true) else {
+            return Err("Не удалось открыть папку журналов".into());
         };
-        if attrs & win::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            let Some(link) = &entry.reparse else {
-                return Err((format!("В резерве появилась ссылка: {}", plain), plain));
-            };
-            let actual = win::read_reparse(&plain)
-                .map_err(|code| (format!("Не удалось прочитать ссылку в резерве {}: {}", plain, win::error_text(code)), plain.clone()))?;
-            if actual.tag != link.tag
-                || !win::normalize_target(&actual.substitute)
-                    .eq_ignore_ascii_case(&win::normalize_target(&link.substitute))
-            {
-                return Err((format!("Ссылка в резерве изменилась: {}", plain), plain));
-            }
-            if link.is_dir {
-                if !win::delete_dir(&plain) {
-                    return Err((format!("Не удалось удалить ссылку {}", plain), plain));
-                }
-            } else if !win::delete_file(&plain) {
-                return Err((format!("Не удалось удалить ссылку {}", plain), plain));
-            }
-            continue;
+        let path = dir.join(self.file_name());
+        let temp = dir.join(format!("journal-{}.tmp", self.id));
+        let write = || -> Result<(), String> {
+            let mut file = File::create(&temp).map_err(|error| format!("журнал: {}", error))?;
+            file.write_all(self.text(state, note).as_bytes())
+                .map_err(|error| format!("журнал: {}", error))?;
+            file.sync_all().map_err(|error| format!("журнал: {}", error))?;
+            Ok(())
+        };
+        if let Err(error) = write() {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
         }
-        if entry.is_dir {
-            for stream in &entry.streams {
-                let path = stream_path(&plain, &stream.name);
-                let mut ctx = Ctx::new(None);
-                let hash = hash_file(&path, &mut ctx).map_err(|e| (format!("Ошибка сверки потока {}: {}", path, e), plain.clone()))?;
-                if hash != stream.hash {
-                    return Err((format!("Содержимое потока каталога в резерве изменилось: {}", plain), plain));
+        if !win::move_path_through(&temp.to_string_lossy(), &path.to_string_lossy(), true) {
+            let _ = fs::remove_file(&temp);
+            return Err(format!("журнал: {}", win::error_text(win::last_error())));
+        }
+        Ok(())
+    }
+
+    fn finish(&self, state: &str, note: &str) {
+        if self.save(state, note).is_ok() {
+            if let Some(dir) = journal_root(false) {
+                let _ = fs::remove_file(dir.join(self.file_name()));
+            }
+        }
+    }
+}
+
+/// Removes the temporary folder, but only the objects this run created. Anything else is left in
+/// place and the path stays visible as the leftover.
+fn cleanup_staging(
+    outcome: &mut Outcome,
+    plan: &Plan,
+    staging_id: win::ObjectId,
+    created: &std::collections::HashSet<win::ObjectId>,
+) {
+    if !remove_tree(&plan.staging, staging_id, created) {
+        outcome.leftover = plan.staging.clone();
+    }
+}
+
+/// Guards the temporary folder: cleanup only removes objects that this operation created, and the
+/// whole traversal is done through held handles, so nothing can be renamed or replaced under it.
+fn remove_tree(path: &str, expected: win::ObjectId, created: &std::collections::HashSet<win::ObjectId>) -> bool {
+    remove_tree_held(path, Some(expected), created)
+}
+
+fn remove_tree_held(
+    path: &str,
+    expected: Option<win::ObjectId>,
+    created: &std::collections::HashSet<win::ObjectId>,
+) -> bool {
+    // The handle is opened without FILE_SHARE_DELETE: while it is held, this directory cannot be
+    // renamed or replaced, so the names below it keep pointing inside the tree we are cleaning.
+    let mut guard = match win::Guard::open_held(
+        path,
+        win::READ_DATA_ACCESS | win::READ_ATTRIBUTES_ACCESS | win::DELETE_ACCESS,
+    ) {
+        Ok(value) => value,
+        Err(_) => return !win::path_exists(path),
+    };
+    let Some(handle_id) = guard.id() else { return false };
+    if let Some(expected) = expected {
+        if handle_id != expected {
+            return false;
+        }
+    }
+    // A foreign object inside the temporary folder is not ours: keep it and stop, so the path can
+    // be shown to the user instead of being deleted silently.
+    if !created.contains(&handle_id) {
+        return false;
+    }
+    let Some(info) = guard.info() else { return false };
+    if info.attrs & win::FILE_ATTRIBUTE_DIRECTORY == 0 || info.attrs & win::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        // A file or a link is deleted through this very handle; a link is never followed.
+        let removed = guard.remove().is_ok();
+        drop(guard);
+        return removed && !win::path_exists(path);
+    }
+    let mut children = Vec::new();
+    match fs::read_dir(path) {
+        Ok(read_dir) => {
+            for item in read_dir.flatten() {
+                match item.file_name().to_str() {
+                    Some(name) => children.push(name.to_string()),
+                    None => return false,
                 }
             }
-            if !win::delete_dir(&plain) {
-                return Err((format!("Не удалось удалить каталог резерва {}", plain), plain));
-            }
-            continue;
         }
-        let info = win::file_info(&plain, false).ok_or_else(|| (format!("Не удалось прочитать {}", plain), plain.clone()))?;
-        if info.index != entry.index || info.serial != entry.serial || info.size != entry.size || info.modified != entry.modified {
-            return Err((format!("Файл резерва изменился: {}", plain), plain));
+        Err(_) => return false,
+    }
+    for name in children {
+        if !remove_tree_held(&win::join(path, &name), None, created) {
+            return false;
+        }
+    }
+    // Still the same directory on the same handle, and it is empty now.
+    let removed = guard.remove().is_ok();
+    drop(guard);
+    removed && !win::path_exists(path)
+}
+
+/// Re-lists the streams and re-reads every recorded one through its own handle. A stream that was
+/// added, removed or changed since the scan stops the delete.
+fn check_streams(path: &str, expected: &[StreamInfo], expected_id: win::ObjectId) -> Result<(), String> {
+    if expected.is_empty() {
+        if win::streams(path).map(|actual| actual.is_empty()).unwrap_or(false) {
+            return Ok(());
+        }
+        return Err(format!("У объекта появились новые потоки: {}", path));
+    }
+    let actual = win::streams(path)
+        .map_err(|code| format!("Не удалось перечислить потоки {}: {}", path, win::error_text(code)))?;
+    if actual.len() != expected.len() {
+        return Err(format!("Набор потоков изменился: {}", path));
+    }
+    let mut actual_names: Vec<&str> = actual.iter().map(|stream| stream.name.as_str()).collect();
+    let mut expected_names: Vec<&str> = expected.iter().map(|stream| stream.name.as_str()).collect();
+    actual_names.sort();
+    expected_names.sort();
+    if actual_names != expected_names {
+        return Err(format!("Имена потоков изменились: {}", path));
+    }
+    for stream in expected {
+        let stream_file = stream_path(path, &stream.name);
+        let guard = win::Guard::open(&stream_file, win::READ_DATA_ACCESS | win::READ_ATTRIBUTES_ACCESS, false)
+            .map_err(|code| format!("Не удалось открыть поток {}: {}", stream_file, win::error_text(code)))?;
+        // A stream path resolves to the base object, so its identity must match that object.
+        if guard.id() != Some(expected_id) {
+            return Err(format!("Поток принадлежит другому объекту: {}", stream_file));
         }
         let mut ctx = Ctx::new(None);
-        let hash = hash_file(&plain, &mut ctx).map_err(|e| (format!("Ошибка сверки {}: {}", plain, e), plain.clone()))?;
-        if Some(&hash) != entry.hash.as_ref() {
-            return Err((format!("Содержимое файла резерва изменилось: {}", plain), plain));
+        let hash = {
+            let file = guard.as_file();
+            hash_stream(&*file, &mut ctx).map(|(value, _)| value)
         }
-        for stream in &entry.streams {
-            let path = stream_path(&plain, &stream.name);
-            let mut ctx = Ctx::new(None);
-            let hash = hash_file(&path, &mut ctx).map_err(|e| (format!("Ошибка сверки потока {}: {}", path, e), plain.clone()))?;
-            if hash != stream.hash {
-                return Err((format!("Содержимое потока резерва изменилось: {}", plain), plain));
-            }
-        }
-        if attrs & win::FILE_ATTRIBUTE_READONLY != 0 {
-            let _ = win::set_attributes(&plain, attrs & !win::FILE_ATTRIBUTE_READONLY);
-        }
-        if !win::delete_file(&plain) {
-            return Err((format!("Не удалось удалить файл резерва {}", plain), plain));
+        .map_err(|error| format!("Ошибка сверки потока {}: {}", stream_file, error))?;
+        if hash != stream.hash {
+            return Err(format!("Содержимое потока изменилось: {}", stream_file));
         }
     }
     Ok(())
 }
 
-fn link_still_valid(link: &str, target: &str, serial: u64, index: u64) -> bool {
+/// Deletes the backup only after every object has been re-checked through the same handle that is
+/// then used to delete it: verification and deletion can never refer to different objects.
+fn delete_backup(plan: &Plan, entries: &[Entry], dest_id: win::ObjectId) -> Result<(), (String, String)> {
+    let stop = |message: String| (message, plan.backup.clone());
+    let mut processed = 0usize;
+    for entry in entries.iter().rev() {
+        if processed % 32 == 0 && !link_still_valid(&plan.source, &plan.dest_final, dest_id) {
+            return Err((format!("Ссылка на новое место перестала быть доступной: {}", plan.source), plan.backup.clone()));
+        }
+        processed += 1;
+        let plain = if entry.rel.is_empty() { plan.backup.clone() } else { win::join(&plan.backup, &entry.rel) };
+        let expected = win::ObjectId { serial: entry.serial, index: entry.index };
+        let access = win::READ_DATA_ACCESS | win::READ_ATTRIBUTES_ACCESS | win::WRITE_ATTRIBUTES_ACCESS
+            | win::DELETE_ACCESS;
+        let mut guard = win::Guard::open(&plain, access, false)
+            .map_err(|code| (format!("Не удалось открыть объект резерва {}: {}", plain, win::error_text(code)), plain.clone()))?;
+        let info = guard
+            .info()
+            .ok_or_else(|| (format!("Не удалось прочитать {}", plain), plain.clone()))?;
+
+        if entry.reparse.is_some() {
+            if info.attrs & win::FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                return Err(stop(format!("В резерве появился обычный объект вместо ссылки: {}", plain)));
+            }
+            let link = entry.reparse.as_ref().unwrap();
+            let actual = guard.reparse().map_err(|code| {
+                (format!("Не удалось прочитать ссылку в резерве {}: {}", plain, win::error_text(code)), plain.clone())
+            })?;
+            if actual.tag != link.tag
+                || !win::normalize_target(&actual.substitute)
+                    .eq_ignore_ascii_case(&win::normalize_target(&link.substitute))
+            {
+                return Err(stop(format!("Ссылка в резерве изменилась: {}", plain)));
+            }
+            guard
+                .remove()
+                .map_err(|code| (format!("Не удалось удалить ссылку {}: {}", plain, win::error_text(code)), plain.clone()))?;
+            drop(guard);
+            if win::path_exists(&plain) {
+                return Err(stop(format!("Ссылка осталась на месте: {}", plain)));
+            }
+            continue;
+        }
+
+        if info.attrs & win::FILE_ATTRIBUTE_DIRECTORY != 0 {
+            if info.attrs & win::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(stop(format!("Тип объекта в резерве изменился: {}", plain)));
+            }
+            if info.id() != expected {
+                return Err(stop(format!("Каталог резерва подменён: {}", plain)));
+            }
+            check_streams(&plain, &entry.streams, expected).map_err(|error| (error, plain.clone()))?;
+            // A directory is deleted only when it is empty: an added object must stop the cleanup.
+            if let Ok(mut read_dir) = fs::read_dir(&plain) {
+                if read_dir.next().is_some() {
+                    return Err(stop(format!("В каталоге резерва появились новые объекты: {}", plain)));
+                }
+            }
+            guard
+                .remove()
+                .map_err(|code| (format!("Не удалось удалить каталог резерва {}: {}", plain, win::error_text(code)), plain.clone()))?;
+            drop(guard);
+            if win::path_exists(&plain) {
+                return Err(stop(format!("Каталог резерва остался на месте: {}", plain)));
+            }
+            continue;
+        }
+
+        if info.attrs & win::FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err(stop(format!("Тип объекта в резерве изменился: {}", plain)));
+        }
+        if info.id() != expected || info.size != entry.size || info.modified != entry.modified {
+            return Err(stop(format!("Файл резерва изменился: {}", plain)));
+        }
+        // The hash is read from the handle that is going to delete this very object.
+        let mut ctx = Ctx::new(None);
+        let hash = {
+            let file = guard.as_file();
+            hash_stream(&*file, &mut ctx).map(|(value, _)| value)
+        }
+        .map_err(|error| (format!("Ошибка сверки {}: {}", plain, error), plain.clone()))?;
+        if Some(&hash) != entry.hash.as_ref() {
+            return Err(stop(format!("Содержимое файла резерва изменилось: {}", plain)));
+        }
+        check_streams(&plain, &entry.streams, expected).map_err(|error| (error, plain.clone()))?;
+        guard
+            .remove()
+            .map_err(|code| (format!("Не удалось удалить файл резерва {}: {}", plain, win::error_text(code)), plain.clone()))?;
+        drop(guard);
+        if win::path_exists(&plain) {
+            return Err(stop(format!("Файл резерва остался на месте: {}", plain)));
+        }
+    }
+    Ok(())
+}
+
+fn link_still_valid(link: &str, target: &str, dest_id: win::ObjectId) -> bool {
     let Some(attrs) = win::attributes(link) else { return false };
     if attrs & win::FILE_ATTRIBUTE_REPARSE_POINT == 0 {
         return false;
@@ -1222,8 +1528,69 @@ fn link_still_valid(link: &str, target: &str, serial: u64, index: u64) -> bool {
     if !stored.eq_ignore_ascii_case(&win::normalize_target(target)) {
         return false;
     }
-    let Some(info) = win::file_info(link, false) else { return false };
-    info.serial == serial && info.index == index
+    win::object_id(link, false) == Some(dest_id)
+}
+
+/// Confirms that the plan still describes the objects the user saw in the preview. A path that now
+/// leads to another folder, or a destination that got occupied in the meantime, stops the transfer
+/// before anything is written.
+fn revalidate_plan(plan: &Plan) -> Result<(), String> {
+    if plan.source.is_empty() || plan.dest_parent.is_empty() || plan.dest_final.is_empty() {
+        return Err("План переноса неполон.".into());
+    }
+    if plan.source.len() <= 3 {
+        return Err(format!("Нельзя переносить корень диска: {}", plan.source));
+    }
+    let Some(source) = win::file_info(&plan.source, true) else {
+        return Err(format!("Исходная папка недоступна: {}", plan.source));
+    };
+    if source.attrs & win::FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(format!("Исходный путь больше не папка: {}", plan.source));
+    }
+    if source.attrs & win::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!("Исходная папка стала ссылкой: {}", plan.source));
+    }
+    if source.id() != plan.source_id {
+        return Err(format!("Исходная папка была заменена после проверки: {}", plan.source));
+    }
+    let Some(dest) = win::file_info(&plan.dest_parent, true) else {
+        return Err(format!("Папка назначения недоступна: {}", plan.dest_parent));
+    };
+    if dest.attrs & win::FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(format!("Место назначения больше не папка: {}", plan.dest_parent));
+    }
+    if dest.attrs & win::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!("Место назначения стало ссылкой: {}", plan.dest_parent));
+    }
+    if dest.id() != plan.dest_parent_id {
+        return Err(format!("Папка назначения была заменена после проверки: {}", plan.dest_parent));
+    }
+    if win::path_exists(&plan.dest_final) {
+        return Err(format!("На новом месте уже есть объект: {}", plan.dest_final));
+    }
+    let Some(source_now) = win::canonical(&plan.source) else {
+        return Err(format!("Не удалось открыть исходную папку: {}", plan.source));
+    };
+    let Some(dest_now) = win::canonical(&plan.dest_parent) else {
+        return Err(format!("Не удалось открыть папку назначения: {}", plan.dest_parent));
+    };
+    if under_or_equal(&dest_now, &source_now) {
+        return Err("Папка назначения находится внутри переносимой папки.".into());
+    }
+    if under_or_equal(&source_now, &plan.dest_final) {
+        return Err("Исходная папка находится внутри папки назначения.".into());
+    }
+    if critical_dirs().iter().any(|dir| under_or_equal(&source_now, dir)) {
+        return Err(format!("Нельзя переносить системные каталоги Windows: {}", source_now));
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        if let Some(canonical_profile) = win::canonical(&profile) {
+            if same_path(&source_now, &canonical_profile) {
+                return Err(format!("Нельзя переносить папку профиля пользователя целиком: {}", source_now));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome {
@@ -1233,15 +1600,28 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
         outcome.detail = plan.error.clone();
         return outcome;
     }
+    // The plan was approved for concrete objects. If either path now points at another object,
+    // nothing is changed and the caller has to preview and confirm again.
+    if let Err(error) = revalidate_plan(plan) {
+        outcome.message = "Условия переноса изменились после проверки. Данные не тронуты.".into();
+        outcome.detail = error;
+        return outcome;
+    }
     let mut ctx = Ctx::new(sink);
-    let journal_id = guid();
-    write_journal(&journal_id, plan, "start", "");
+    let mut journal = Journal::new(plan);
+    // Without a recovery record the operation must not start: if anything goes wrong later,
+    // nobody could tell what happened to which folder.
+    if let Err(error) = journal.save("start", "") {
+        outcome.message = "Не удалось записать журнал восстановления. Перенос не начат, данные не тронуты.".into();
+        outcome.detail = error;
+        return outcome;
+    }
 
-    let fail = |outcome: &mut Outcome, message: String, detail: String, state: &str| {
+    let fail = |outcome: &mut Outcome, journal: &Journal, message: String, detail: String, state: &str| {
         outcome.ok = false;
         outcome.message = message;
         outcome.detail = detail.clone();
-        write_journal(&journal_id, plan, state, &format!("error={}", detail));
+        let _ = journal.save(state, &format!("error={}", detail));
     };
 
     // Preflight: can we create a directory symlink next to the source?
@@ -1250,37 +1630,49 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
     ctx.report(true);
     let probe_link = win::join(&plan.source_parent, &format!(".linkerino-probe-{}", guid()));
     if let Err(code) = win::symlink(&probe_link, &plan.dest_final, true) {
-        fail(&mut outcome, "Не удалось проверить возможность создать ссылку. Перенос не начат, данные не тронуты.".into(),
+        fail(&mut outcome, &journal, "Не удалось проверить возможность создать ссылку. Перенос не начат, данные не тронуты.".into(),
              win::error_text(code), "failed");
         outcome.needs_elevation = code == 1314;
         return outcome;
     }
     let _ = win::delete_dir(&probe_link);
-    if win::path_exists(&plan.staging) {
-        fail(&mut outcome, "Служебная папка уже существует. Перенос не начат.".into(), plan.staging.clone(), "failed");
-        return outcome;
-    }
-    if !win::create_dir(&plan.staging) {
-        fail(&mut outcome, "Не удалось создать временную папку. Данные не тронуты.".into(),
-             win::error_text(win::last_error()), "failed");
-        return outcome;
-    }
-    write_journal(&journal_id, plan, "copying", "");
 
-    let cleanup_staging = |outcome: &mut Outcome| {
-        if !remove_tree(&plan.staging) {
-            outcome.leftover = plan.staging.clone();
-        }
+    // The staging folder is created by this run and never adopted: an existing object is a failure.
+    if !win::create_dir_new(&plan.staging) {
+        fail(&mut outcome, &journal, "Не удалось создать временную папку. Данные не тронуты.".into(),
+             format!("{}: {}", plan.staging, win::error_text(win::last_error())), "failed");
+        return outcome;
+    }
+    let Some(staging_id) = win::object_id(&plan.staging, false) else {
+        fail(&mut outcome, &journal, "Не удалось подтвердить временную папку. Данные не тронуты.".into(),
+             plan.staging.clone(), "failed");
+        return outcome;
     };
+    let mut created: std::collections::HashSet<win::ObjectId> = std::collections::HashSet::new();
+    created.insert(staging_id);
+    // The temporary tree gets the rights of the original root immediately, so the names being
+    // copied are never exposed through a wider inherited DACL.
+    if !win::apply_acl(&plan.source, &plan.staging) {
+        ctx.item = "Не удалось применить права доступа к временной папке".into();
+        ctx.report(true);
+    }
+    let _ = journal.save("copying", "");
 
     // Scan.
     ctx.phase = Phase::Scan;
     ctx.item = plan.source.clone();
     ctx.report(true);
     let mut entries: Vec<Entry> = Vec::new();
-    if let Err(error) = scan_dir(&plan.source, "", 0, &mut entries) {
-        cleanup_staging(&mut outcome);
-        fail(&mut outcome, "Перенос остановлен до копирования: неподдерживаемые объекты. Оригинал не изменён.".into(),
+    if let Err(error) = scan_dir(&plan.source, "", 0, &mut entries, &mut ctx) {
+        cleanup_staging(&mut outcome, plan, staging_id, &created);
+        if ctx.cancelled {
+            outcome.cancelled = true;
+            outcome.message = "Отменено до изменения исходной папки. Оригинал на месте.".into();
+            outcome.detail = error.clone();
+            let _ = journal.save("cancelled", &format!("error={}", error));
+            return outcome;
+        }
+        fail(&mut outcome, &journal, "Перенос остановлен до копирования: неподдерживаемые объекты. Оригинал не изменён.".into(),
              error, "failed");
         return outcome;
     }
@@ -1288,30 +1680,47 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
     let caps = match probe_caps(&plan.dest_parent) {
         Ok(value) => value,
         Err(error) => {
-            cleanup_staging(&mut outcome);
-            fail(&mut outcome, "Новое место недоступно для записи. Оригинал не изменён.".into(), error, "failed");
+            cleanup_staging(&mut outcome, plan, staging_id, &created);
+            fail(&mut outcome, &journal, "Новое место недоступно для записи. Оригинал не изменён.".into(), error, "failed");
             return outcome;
         }
     };
     let has_links = entries.iter().any(|e| e.reparse.is_some());
     if has_links && !caps.reparse {
-        cleanup_staging(&mut outcome);
-        fail(&mut outcome, "В папке есть ссылки, а на новом месте их создать нельзя. Оригинал не изменён.".into(),
+        cleanup_staging(&mut outcome, plan, staging_id, &created);
+        fail(&mut outcome, &journal, "В папке есть ссылки, а на новом месте их создать нельзя. Оригинал не изменён.".into(),
              format!("Файловая система назначения ({}) не поддерживает ссылки. Выберите диск NTFS.", caps.fs), "failed");
         return outcome;
     }
-    let mut notes = String::new();
-    if !caps.acl {
-        notes.push_str("Права доступа NTFS не перенесены: файловая система назначения их не поддерживает.\n");
+    // Data-bearing properties are never dropped silently: a destination without streams cannot
+    // hold them, so the transfer stops while the original is still untouched.
+    let files_with_streams = entries
+        .iter()
+        .filter(|entry| !entry.is_dir && entry.reparse.is_none() && !entry.streams.is_empty())
+        .count();
+    if !caps.streams && files_with_streams > 0 {
+        cleanup_staging(&mut outcome, plan, staging_id, &created);
+        fail(&mut outcome, &journal,
+             "В папке есть именованные потоки, а новое место их не поддерживает. Оригинал не изменён.".into(),
+             format!("Файлов с потоками: {}. Файловая система назначения: {}.", files_with_streams, caps.fs),
+             "failed");
+        return outcome;
     }
-    if !caps.streams {
-        let count: usize = entries.iter().map(|e| e.streams.len()).sum();
-        if count > 0 {
-            notes.push_str(&format!("Именованные потоки NTFS не перенесены: {}.\n", count));
-        }
+    let dirs_with_streams = entries.iter().filter(|entry| entry.is_dir && !entry.streams.is_empty()).count();
+    if !caps.dir_streams && dirs_with_streams > 0 {
+        cleanup_staging(&mut outcome, plan, staging_id, &created);
+        fail(&mut outcome, &journal,
+             "В папке есть потоки каталогов, а новое место их не поддерживает. Оригинал не изменён.".into(),
+             format!("Каталогов с потоками: {}. Файловая система назначения: {}.", dirs_with_streams, caps.fs),
+             "failed");
+        return outcome;
+    }
+    let mut notes = String::new();
+    if !caps.acl && entries.iter().any(|entry| entry.dacl_explicit) {
+        notes.push_str("Права доступа: на новом месте их нельзя сохранить, а у источника они заданы явно или не читаются.\n");
     }
     if !caps.hardlinks {
-        let groups = entries.iter().filter(|e| e.hardlink_primary.is_some()).count();
+        let groups = entries.iter().filter(|entry| entry.hardlink_primary.is_some()).count();
         if groups > 0 {
             notes.push_str(&format!("Жёсткие ссылки не сохранены: {} файл(ов) скопированы отдельно.\n", groups));
         }
@@ -1341,8 +1750,8 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
     let free = if faults.low_space { Some(0) } else { win::free_space(&plan.dest_parent) };
     if let Some(free) = free {
         if total_bytes > free {
-            cleanup_staging(&mut outcome);
-            fail(&mut outcome, "На новом диске недостаточно свободного места. Оригинал не изменён.".into(),
+            cleanup_staging(&mut outcome, plan, staging_id, &created);
+            fail(&mut outcome, &journal, "На новом диске недостаточно свободного места. Оригинал не изменён.".into(),
                  format!("Нужно {} байт, свободно {}", total_bytes, free), "failed");
             return outcome;
         }
@@ -1352,16 +1761,16 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
     ctx.phase = Phase::Copy;
     ctx.item.clear();
     ctx.report(true);
-    if let Err(error) = copy_tree(plan, &mut entries, &mut ctx, faults, &caps) {
-        cleanup_staging(&mut outcome);
+    if let Err(error) = copy_tree(plan, &mut entries, &mut ctx, faults, &caps, &mut created) {
+        cleanup_staging(&mut outcome, plan, staging_id, &created);
         if ctx.cancelled {
             outcome.cancelled = true;
             outcome.message = "Отменено до изменения исходной папки. Оригинал на месте.".into();
             outcome.detail = error.clone();
-            write_journal(&journal_id, plan, "cancelled", &format!("error={}", error));
+            let _ = journal.save("cancelled", &format!("error={}", error));
             return outcome;
         }
-        fail(&mut outcome, "Копирование не завершено. Оригинал не изменён.".into(), error, "failed");
+        fail(&mut outcome, &journal, "Копирование не завершено. Оригинал не изменён.".into(), error, "failed");
         return outcome;
     }
 
@@ -1383,119 +1792,185 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
     ctx.report(true);
     if let Err(error) = verify_tree(&plan.staging, &entries, &mut ctx, &caps) {
         if ctx.cancelled {
-            cleanup_staging(&mut outcome);
+            cleanup_staging(&mut outcome, plan, staging_id, &created);
             outcome.cancelled = true;
             outcome.message = "Отменено во время сверки. Оригинал на месте.".into();
-            write_journal(&journal_id, plan, "cancelled", &format!("error={}", error));
+            let _ = journal.save("cancelled", &format!("error={}", error));
             return outcome;
         }
-        cleanup_staging(&mut outcome);
-        fail(&mut outcome, "Сверка копии не прошла. Оригинал не изменён.".into(), error, "failed");
+        cleanup_staging(&mut outcome, plan, staging_id, &created);
+        fail(&mut outcome, &journal, "Сверка копии не прошла. Оригинал не изменён.".into(), error, "failed");
         return outcome;
     }
     if faults.verify_mismatch {
-        cleanup_staging(&mut outcome);
-        fail(&mut outcome, "Сверка копии не прошла. Оригинал не изменён.".into(), "Тестовый сбой сверки".into(), "failed");
+        cleanup_staging(&mut outcome, plan, staging_id, &created);
+        fail(&mut outcome, &journal, "Сверка копии не прошла. Оригинал не изменён.".into(), "Тестовый сбой сверки".into(), "failed");
         return outcome;
     }
     if let Err(error) = verify_source_unchanged(plan, &entries) {
-        cleanup_staging(&mut outcome);
-        fail(&mut outcome, "Исходная папка изменилась во время переноса. Оригинал не тронут.".into(), error, "failed");
+        cleanup_staging(&mut outcome, plan, staging_id, &created);
+        fail(&mut outcome, &journal, "Исходная папка изменилась во время переноса. Оригинал не тронут.".into(), error, "failed");
         return outcome;
     }
-    write_journal(&journal_id, plan, "verified", &format!("files={}", total_files));
+    // The last point where nothing is renamed yet: the record of a verified copy must exist before
+    // the folder name starts changing, otherwise a crash would leave an unexplained staging folder.
+    if let Err(error) = journal.save("verified", &format!("files={}", total_files)) {
+        cleanup_staging(&mut outcome, plan, staging_id, &created);
+        fail(&mut outcome, &journal,
+             "Журнал восстановления не записан, поэтому перенос остановлен до публикации. Оригинал не изменён.".into(),
+             error, "failed");
+        return outcome;
+    }
 
-    // Publish.
+    // Publish. The rename must be recorded on disk, otherwise the new name could disappear
+    // while the old folder is already gone.
     ctx.phase = Phase::Publish;
     ctx.item = plan.dest_final.clone();
     ctx.report(true);
-    if !win::move_path(&plan.staging, &plan.dest_final, false) {
+    if !win::move_path_through(&plan.staging, &plan.dest_final, false) {
         outcome.leftover = plan.staging.clone();
-        fail(&mut outcome, "Не удалось опубликовать копию. Оригинал не изменён, копия сохранена.".into(),
+        fail(&mut outcome, &journal, "Не удалось опубликовать копию. Оригинал не изменён, копия сохранена.".into(),
              win::error_text(win::last_error()), "failed");
         return outcome;
     }
     let Some(dest_info) = win::file_info(&plan.dest_final, false) else {
         outcome.leftover = plan.dest_final.clone();
-        fail(&mut outcome, "Копия опубликована, но проверить её не удалось. Оригинал не изменён.".into(),
+        fail(&mut outcome, &journal, "Копия опубликована, но проверить её не удалось. Оригинал не изменён.".into(),
              String::new(), "published");
         return outcome;
     };
-    write_journal(&journal_id, plan, "published",
-                  &format!("volume={} index={}", dest_info.serial, dest_info.index));
+    let dest_id = dest_info.id();
+    journal.dest_id = Some(dest_id);
+    journal.files = total_files;
+    if let Err(error) = journal.save("published", "") {
+        // The destination exists but cannot be described in the journal: stop before the rename.
+        outcome.leftover = plan.dest_final.clone();
+        fail(&mut outcome, &journal, "Копия опубликована, но журнал восстановления не записан. Исходная папка не изменена.".into(),
+             error, "published");
+        return outcome;
+    }
 
-    // Relink.
+    // Relink. The intention to create a link is recorded before the original is renamed, so a
+    // crash at any point leaves a state that matches what a person will actually find on disk.
     ctx.phase = Phase::Link;
     ctx.item = plan.source.clone();
     ctx.report(true);
-    if !win::move_path(&plan.source, &plan.backup, false) {
+    if !win::move_path_through(&plan.source, &plan.backup, false) {
         outcome.leftover = plan.dest_final.clone();
-        fail(&mut outcome, "Копия готова, но переименовать оригинал не удалось. Исходная папка не изменена.".into(),
+        fail(&mut outcome, &journal, "Копия готова, но переименовать оригинал не удалось. Исходная папка не изменена.".into(),
              win::error_text(win::last_error()), "published");
         return outcome;
     }
-    write_journal(&journal_id, plan, "backup", "");
+    if let Err(error) = journal.save("backup", "") {
+        // Without a record of the backup the situation cannot be explained later: undo the rename.
+        let restored = win::move_path(&plan.backup, &plan.source, false);
+        outcome.leftover = if restored { plan.dest_final.clone() } else { plan.backup.clone() };
+        fail(&mut outcome, &journal,
+             if restored {
+                 "Журнал восстановления недоступен, поэтому перенос остановлен. Исходная папка на месте.".into()
+             } else {
+                 "Журнал восстановления недоступен, и вернуть исходное имя не удалось. Данные целы в двух местах.".into()
+             },
+             error, if restored { "published" } else { "relink-failed-leftover" });
+        return outcome;
+    }
+    if let Err(error) = journal.save("linking", "") {
+        let restored = win::move_path_through(&plan.backup, &plan.source, false);
+        outcome.leftover = if restored { plan.dest_final.clone() } else { plan.backup.clone() };
+        fail(&mut outcome, &journal,
+             if restored {
+                 "Журнал восстановления недоступен, поэтому ссылка не создавалась. Исходная папка на месте.".into()
+             } else {
+                 "Журнал восстановления недоступен. Данные целы в двух местах, ссылка не создавалась.".into()
+             },
+             error, if restored { "published" } else { "relink-failed-leftover" });
+        return outcome;
+    }
     let link_result = if faults.link_failure {
         Err(1u32)
     } else {
         win::symlink(&plan.source, &plan.dest_final, true)
     };
     if let Err(code) = link_result {
-        let restored = win::move_path(&plan.backup, &plan.source, false);
-        outcome.leftover = if restored { plan.dest_final.clone() } else { plan.backup.clone() };
         let detail = win::error_text(code);
-        fail(&mut outcome,
-             if restored {
-                 "Ссылку создать не удалось. Исходная папка восстановлена, проверенная копия осталась на новом месте.".into()
-             } else {
-                 "Ссылку создать не удалось, и вернуть исходное имя не получилось. Данные целы в двух местах.".into()
-             },
-             detail, "relink-failed");
+        let (message, leftover) = undo_link(plan, dest_id, true);
+        let state = if leftover == plan.backup { "relink-failed-leftover" } else { "relink-failed" };
+        outcome.leftover = leftover;
+        fail(&mut outcome, &journal, message, detail, state);
         return outcome;
     }
-    if !link_still_valid(&plan.source, &plan.dest_final, dest_info.serial, dest_info.index) {
-        let _ = win::delete_dir(&plan.source);
-        let restored = win::move_path(&plan.backup, &plan.source, false);
-        outcome.leftover = if restored { plan.dest_final.clone() } else { plan.backup.clone() };
-        fail(&mut outcome, "Ссылка не прошла проверку и удалена. Исходная папка восстановлена.".into(),
-             String::new(), "relink-failed");
+    if !link_still_valid(&plan.source, &plan.dest_final, dest_id) {
+        let (message, leftover) = undo_link(plan, dest_id, false);
+        let state = if leftover == plan.backup { "relink-failed-leftover" } else { "relink-failed" };
+        outcome.leftover = leftover;
+        fail(&mut outcome, &journal, message, String::new(), state);
         return outcome;
     }
-    write_journal(&journal_id, plan, "linked", "");
+    if let Err(error) = journal.save("linked", "") {
+        // The link works and the backup still exists. Deleting it now would leave no record of
+        // what happened if anything goes wrong, so the cleanup waits for the next run.
+        outcome.ok = true;
+        outcome.leftover = plan.backup.clone();
+        outcome.message =
+            "Перенос выполнен, ссылка работает. Журнал восстановления не записан, поэтому старый экземпляр сохранён."
+                .into();
+        outcome.detail = error;
+        return outcome;
+    }
 
     // Cleanup.
     ctx.phase = Phase::Cleanup;
     ctx.item = plan.dest_final.clone();
     ctx.report(true);
-    if !link_still_valid(&plan.source, &plan.dest_final, dest_info.serial, dest_info.index) {
+    if !link_still_valid(&plan.source, &plan.dest_final, dest_id) {
         outcome.leftover = plan.backup.clone();
-        fail(&mut outcome, "Ссылка на старом месте недоступна, старый экземпляр не удалён. Данные сохранены.".into(),
+        fail(&mut outcome, &journal, "Ссылка на старом месте недоступна, старый экземпляр не удалён. Данные сохранены.".into(),
              String::new(), "link-lost");
         return outcome;
     }
     let mut cleanup_ctx = Ctx::new(None);
     if let Err(error) = verify_tree(&plan.dest_final, &entries, &mut cleanup_ctx, &caps) {
         outcome.leftover = plan.backup.clone();
-        fail(&mut outcome, "Копия изменилась после публикации. Старый экземпляр не удалён, данные сохранены.".into(),
+        fail(&mut outcome, &journal, "Копия изменилась после публикации. Старый экземпляр не удалён, данные сохранены.".into(),
              error, "cleanup-skipped");
         return outcome;
     }
-    let mut durability = !faults.force_flush_failure && win::flush_volume(&plan.dest_final);
-    if !durability && caps.remote && !faults.force_flush_failure {
-        durability = true;
+    // Durability: every file was flushed with FlushFileBuffers right after it was written and the
+    // rename used MOVEFILE_WRITE_THROUGH, which Windows documents as "does not return until the
+    // file is actually moved on the disk". That covers a local volume without elevation.
+    // A network share is different: the server decides when its cache reaches the media, so the
+    // backup is kept until a person decides otherwise.
+    let durability = !faults.force_flush_failure && !caps.remote;
+    if durability {
+        let _ = win::flush_volume(&plan.dest_final);
     }
     if !durability {
+        let reason = if caps.remote {
+            "сетевое хранилище не подтверждает запись на диск"
+        } else {
+            "подтвердить запись на диск не удалось"
+        };
         outcome.ok = true;
         outcome.leftover = plan.backup.clone();
-        outcome.message =
-            "Перенос выполнен, ссылка работает. Подтвердить запись на диск не удалось, поэтому старый экземпляр сохранён."
-                .into();
-        write_journal(&journal_id, plan, "cleanup-skipped-durability", "volume-flush-failed");
+        outcome.message = format!("Перенос выполнен, ссылка работает. Старый экземпляр сохранён: {}.", reason);
+        outcome.notes.push_str(&format!("Старый экземпляр сохранён: {}.\n", reason));
+        let _ = journal.save("cleanup-skipped-durability", reason);
         return outcome;
     }
-    match delete_backup(plan, &entries, dest_info.serial, dest_info.index) {
+    if let Some(reason) = protect_from_losses(&entries, &caps) {
+        outcome.ok = true;
+        outcome.leftover = plan.backup.clone();
+        outcome.message = format!(
+            "Перенос выполнен, ссылка работает. Старый экземпляр сохранён: {}.",
+            reason
+        );
+        outcome.notes.push_str(&format!("Старый экземпляр сохранён: {}.\n", reason));
+        let _ = journal.save("cleanup-skipped-metadata", &reason);
+        return outcome;
+    }
+    match delete_backup(plan, &entries, dest_id) {
         Ok(()) => {
-            remove_journal(&journal_id);
+            journal.finish("done", "");
             outcome.ok = true;
             outcome.message = "Готово. Папка перенесена, на старом месте — ссылка на новое место.".into();
             outcome
@@ -1510,38 +1985,183 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
                 format!("Перенос выполнен, ссылка работает. Старый экземпляр удалён не полностью: {}", error)
             };
             outcome.detail = error;
-            write_journal(&journal_id, plan, if link_lost { "link-lost" } else { "cleanup-partial" }, "");
+            let _ = journal.save(if link_lost { "link-lost" } else { "cleanup-partial" }, "");
             outcome
         }
     }
 }
 
-/// Journals that describe a transfer that may have stopped mid-way.
-/// Finished outcomes (failed, cancelled, relink-failed, cleanup-*) are kept on disk but do not
-/// need to be shown at startup: the user already saw their result.
-const ATTENTION_STATES: [&str; 5] = ["start", "copying", "verified", "published", "backup"];
-
-fn journal_state(text: &str) -> &str {
-    text.lines().rev().find_map(|line| line.strip_prefix("state=")).unwrap_or("").trim()
+/// Removes the link that this run created and puts the original folder back. Returns an honest
+/// message and the path that still holds the data, depending on what actually succeeded.
+fn undo_link(plan: &Plan, dest_id: win::ObjectId, creation_failed: bool) -> (String, String) {
+    // Only a link that points at our own copy is removed: anything else is left untouched.
+    let mut link_removed = false;
+    let mut link_state = "нет";
+    if win::attributes(&plan.source).map(|attrs| attrs & win::FILE_ATTRIBUTE_REPARSE_POINT != 0).unwrap_or(false)
+        && link_still_valid(&plan.source, &plan.dest_final, dest_id)
+    {
+        match win::Guard::open(&plan.source, win::READ_ATTRIBUTES_ACCESS | win::DELETE_ACCESS, false) {
+            Ok(mut guard) => {
+                if guard.remove().is_ok() {
+                    drop(guard);
+                    link_removed = !win::path_exists(&plan.source);
+                    link_state = if link_removed { "убрана" } else { "осталась" };
+                } else {
+                    link_state = "осталась";
+                }
+            }
+            Err(_) => link_state = "осталась",
+        }
+    }
+    let restored = if link_removed || !win::path_exists(&plan.source) {
+        win::move_path_through(&plan.backup, &plan.source, false)
+    } else {
+        false
+    };
+    if restored {
+        let message = if creation_failed {
+            "Ссылку создать не удалось. Исходная папка восстановлена, проверенная копия осталась на новом месте.".to_string()
+        } else {
+            "Ссылка не прошла проверку и удалена. Исходная папка восстановлена, проверенная копия осталась на новом месте.".to_string()
+        };
+        return (message, plan.dest_final.clone());
+    }
+    let message = format!(
+        "Перенос остановлен: ссылка {}, исходное имя восстановить не удалось. Данные целы: копия {}, резерв {}.",
+        link_state, plan.dest_final, plan.backup
+    );
+    (message, plan.backup.clone())
 }
 
-pub fn unfinished_journals() -> Vec<std::path::PathBuf> {
-    let Some(base) = journal_dir() else { return Vec::new() };
+/// Decides whether the old folder may be deleted when the destination cannot hold every property
+/// of the source. Data-bearing losses are refused much earlier; this covers metadata only.
+fn protect_from_losses(entries: &[Entry], caps: &Caps) -> Option<String> {
+    if !caps.acl && entries.iter().any(|entry| entry.dacl_explicit) {
+        return Some("на новом месте нельзя сохранить права доступа, а у источника они заданы явно или не читаются".to_string());
+    }
+    if !caps.hardlinks && entries.iter().any(|entry| entry.hardlink_primary.is_some()) {
+        return Some("жёсткие ссылки на новом месте не поддерживаются".to_string());
+    }
+    None
+}
+
+/// Journals that describe a transfer which is not finished or left data behind: the link may be
+/// missing, or the old folder may still occupy space. Refusals that leave the source in place
+/// (`failed`, `cancelled`) stay on disk for diagnosis and are not reported at startup, because the
+/// user already saw their result and nothing was moved.
+const ATTENTION_STATES: [&str; 13] = [
+    "start",
+    "copying",
+    "verified",
+    "published",
+    "backup",
+    "linking",
+    "linked",
+    "cleanup-partial",
+    "cleanup-skipped",
+    "cleanup-skipped-durability",
+    "cleanup-skipped-metadata",
+    "link-lost",
+    "relink-failed-leftover",
+];
+
+/// What the GUI needs to tell a person about one interrupted transfer.
+#[derive(Clone, Default)]
+pub struct JournalSummary {
+    pub path: std::path::PathBuf,
+    pub state: String,
+    pub source: String,
+    pub dest: String,
+    pub backup: String,
+}
+
+impl JournalSummary {
+    /// Short Russian description of the recorded state, for people rather than for logs.
+    pub fn state_text(&self) -> &'static str {
+        match self.state.as_str() {
+            "start" | "copying" | "verified" => "перенос не завершён",
+            "published" | "backup" => "копия готова, ссылка не создана",
+            "linking" => "создавалась ссылка, проверьте папку",
+            "linked" => "ссылка создана, резерв мог остаться",
+            "cleanup-partial" => "резерв удалён не полностью",
+            "cleanup-skipped" | "cleanup-skipped-durability" | "cleanup-skipped-metadata" => {
+                "резерв сохранён намеренно"
+            }
+            "link-lost" => "ссылка перестала работать, резерв сохранён",
+            "relink-failed-leftover" => "исходное имя не вернулось, данные в двух местах",
+            "unreadable" => "запись журнала не читается",
+            _ => "состояние неизвестно",
+        }
+    }
+}
+
+fn journal_field<'a>(text: &'a str, key: &str) -> &'a str {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
+        .map(|value| value.trim())
+        .unwrap_or("")
+}
+
+const JOURNAL_READ_LIMIT: u64 = 64 * 1024;
+
+fn read_journal(path: &std::path::Path) -> Option<String> {
+    // A journal is a small regular file created by this program: links and oversized files are
+    // skipped instead of being followed.
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > JOURNAL_READ_LIMIT {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).to_string())
+}
+
+pub fn unfinished_journals() -> Vec<JournalSummary> {
+    let Some(base) = journal_root(false) else {
+        // No folder yet means no transfer has ever run here.
+        return Vec::new();
+    };
+    let read_dir = match fs::read_dir(&base) {
+        Ok(value) => value,
+        Err(_) => {
+            // The folder exists but cannot be listed: saying "nothing pending" would be a lie.
+            return vec![JournalSummary {
+                path: base,
+                state: "unreadable".to_string(),
+                ..Default::default()
+            }];
+        }
+    };
     let mut result = Vec::new();
-    if let Ok(read_dir) = fs::read_dir(&base) {
+    {
         for item in read_dir.flatten() {
             let name = item.file_name().to_string_lossy().to_string();
             if !name.starts_with("journal-") || !name.ends_with(".txt") {
                 continue;
             }
-            let text = fs::read_to_string(item.path()).unwrap_or_default();
-            let state = journal_state(&text);
-            // An empty state means the journal was cut short, so it needs attention too.
-            if state.is_empty() || ATTENTION_STATES.contains(&state) {
-                result.push(item.path());
+            let Some(text) = read_journal(&item.path()) else {
+                // The name says "journal" but the content cannot be read: say so instead of
+                // pretending there is nothing to see.
+                result.push(JournalSummary {
+                    path: item.path(),
+                    state: "unreadable".to_string(),
+                    ..Default::default()
+                });
+                continue;
+            };
+            let state = journal_field(&text, "state");
+            // An empty state means the record was cut short, so it needs attention too.
+            if !state.is_empty() && !ATTENTION_STATES.contains(&state) {
+                continue;
             }
+            result.push(JournalSummary {
+                path: item.path(),
+                state: if state.is_empty() { "unreadable".to_string() } else { state.to_string() },
+                source: unescape_value(journal_field(&text, "source")),
+                dest: unescape_value(journal_field(&text, "dest")),
+                backup: unescape_value(journal_field(&text, "backup")),
+            });
         }
     }
-    result.sort();
+    result.sort_by(|left, right| left.path.cmp(&right.path));
     result
 }

@@ -96,10 +96,11 @@ fn cleanup(root: &Path) {
     remove_tree(root);
     let root_text = root.to_string_lossy().to_string();
     for journal in engine::unfinished_journals() {
-        if let Ok(text) = fs::read_to_string(&journal) {
-            if text.contains(&root_text) {
-                let _ = fs::remove_file(&journal);
-            }
+        let relevant = journal.source.contains(&root_text)
+            || journal.dest.contains(&root_text)
+            || journal.backup.contains(&root_text);
+        if relevant {
+            let _ = fs::remove_file(&journal.path);
         }
     }
 }
@@ -390,8 +391,13 @@ fn extra_object_in_copy_is_rejected() {
     assert!(outcome.message.contains("Сверка копии не прошла"), "{}", outcome.message);
     assert!(outcome.detail.contains("лишний объект"), "{}", outcome.detail);
     assert!(!win::is_reparse(&source.to_string_lossy()));
-    assert!(!win::path_exists(&plan.staging));
+    // A foreign object appeared in the temporary folder: cleanup must keep it instead of deleting
+    // something this run did not create, and the path must stay visible as the leftover.
+    assert_eq!(outcome.leftover, plan.staging);
+    assert!(win::path_exists(&plan.staging), "the foreign object must not be deleted");
+    assert!(win::path_exists(&win::join(&plan.staging, "linkerino-tamper-extra.tmp")));
     assert!(!win::path_exists(&plan.dest_final));
+    remove_tree(Path::new(&plan.staging));
     cleanup(&root);
 }
 
@@ -452,9 +458,9 @@ fn only_interrupted_journals_need_attention() {
     fs::write(&finished, "state=failed\nsource=D:\\a\ndest=D:\\b\nstaging=D:\\s\nbackup=D:\\k\nerror=x\n").unwrap();
     fs::write(&truncated, "").unwrap();
     let journals = engine::unfinished_journals();
-    let has_pending = journals.iter().any(|path| path == &pending);
-    let has_finished = journals.iter().any(|path| path == &finished);
-    let has_truncated = journals.iter().any(|path| path == &truncated);
+    let has_pending = journals.iter().any(|journal| journal.path == pending);
+    let has_finished = journals.iter().any(|journal| journal.path == finished);
+    let has_truncated = journals.iter().any(|journal| journal.path == truncated);
     let _ = fs::remove_file(&pending);
     let _ = fs::remove_file(&finished);
     let _ = fs::remove_file(&truncated);
@@ -478,5 +484,163 @@ fn unicode_names_survive() {
     assert!(outcome.ok, "{} / {}", outcome.message, outcome.detail);
     assert!(read(&source.join("файл с пробелом.txt")) == "привет".as_bytes());
     assert!(read(&Path::new(&plan.dest_final).join("папка").join("ёмкость.txt")) == "тест".as_bytes());
+    cleanup(&root);
+}
+#[test]
+fn named_streams_are_read_exactly() {
+    let root = temp_root();
+    let file = root.join("probe.bin");
+    write(&file, b"x");
+    fs::write(format!("{}:custom:$DATA", file.to_string_lossy()), b"stream-data").unwrap();
+    let names: Vec<(String, u64)> = win::streams(&file.to_string_lossy())
+        .expect("streams")
+        .into_iter()
+        .map(|stream| (stream.name, stream.size))
+        .collect();
+    assert_eq!(names, vec![("custom".to_string(), 11)]);
+    cleanup(&root);
+}
+#[test]
+fn plan_is_revalidated_before_any_change() {
+    let root = temp_root();
+    require_symlinks(&root);
+    let source = root.join("src").join("Data");
+    let dest_parent = root.join("dest");
+    write(&source.join("keep.txt"), b"original");
+    fs::create_dir_all(&dest_parent).unwrap();
+    let plan = engine::build_plan(&source.to_string_lossy(), &dest_parent.to_string_lossy());
+    assert!(plan.valid, "{}", plan.error);
+    // Replace the confirmed folder with another one at the same path.
+    fs::rename(&source, root.join("src").join("Data-old")).unwrap();
+    write(&source.join("other.txt"), b"other");
+    let outcome = engine::execute(&plan, None, &Faults::default());
+    assert!(!outcome.ok, "a replaced source must stop the transfer");
+    assert!(outcome.message.contains("изменились"), "unexpected message: {}", outcome.message);
+    assert!(!win::path_exists(&plan.dest_final), "nothing must be published");
+    assert!(!win::path_exists(&plan.staging), "staging must not be left behind");
+    assert!(source.join("other.txt").exists(), "the current folder must stay untouched");
+    cleanup(&root);
+}
+
+#[test]
+fn interrupted_transfer_keeps_a_journal() {
+    init_journals();
+    let root = temp_root();
+    require_symlinks(&root);
+    let source = root.join("src").join("Data");
+    let dest_parent = root.join("dest");
+    write(&source.join("file.txt"), b"payload");
+    fs::create_dir_all(&dest_parent).unwrap();
+    let plan = engine::build_plan(&source.to_string_lossy(), &dest_parent.to_string_lossy());
+    assert!(plan.valid, "{}", plan.error);
+    let mut faults = Faults::default();
+    faults.link_failure = true;
+    let outcome = engine::execute(&plan, None, &faults);
+    assert!(!outcome.ok);
+    let journals = engine::unfinished_journals();
+    let found = journals.iter().find(|journal| journal.source.contains(&root.to_string_lossy().to_string()));
+    // relink-failed is a finished state, so it must be kept on disk but not reported as pending.
+    let dir = PathBuf::from(std::env::var("LINKERINO_JOURNAL_DIR").unwrap());
+    let files: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|item| item.path())
+        .filter(|path| {
+            fs::read_to_string(path)
+                .map(|text| text.contains("state=relink-failed") && text.contains(&plan.source.replace('\\', "\\\\")))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(files.len(), 1, "the journal of the failed link must describe the situation");
+    assert!(found.is_none(), "a finished state must not be reported as pending");
+    for file in files {
+        let _ = fs::remove_file(file);
+    }
+    cleanup(&root);
+}
+
+#[test]
+fn successful_transfer_leaves_no_journal() {
+    init_journals();
+    let root = temp_root();
+    require_symlinks(&root);
+    let source = root.join("src").join("Data");
+    let dest_parent = root.join("dest");
+    write(&source.join("file.txt"), b"payload");
+    fs::create_dir_all(&dest_parent).unwrap();
+    let plan = engine::build_plan(&source.to_string_lossy(), &dest_parent.to_string_lossy());
+    assert!(plan.valid, "{}", plan.error);
+    let outcome = engine::execute(&plan, None, &Faults::default());
+    assert!(outcome.ok, "{} / {}", outcome.message, outcome.detail);
+    let dir = PathBuf::from(std::env::var("LINKERINO_JOURNAL_DIR").unwrap());
+    let leftovers: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|item| item.path())
+        .filter(|path| {
+            fs::read_to_string(path).map(|text| text.contains(&plan.source.replace('\\', "\\\\"))).unwrap_or(false)
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "a finished transfer must not leave a journal: {:?}", leftovers);
+    cleanup(&root);
+}
+
+#[test]
+fn unreadable_and_kept_backup_journals_are_reported() {
+    init_journals();
+    let dir = PathBuf::from(std::env::var("LINKERINO_JOURNAL_DIR").unwrap());
+    let broken = dir.join("journal-test-broken.txt");
+    let kept = dir.join("journal-test-kept.txt");
+    let lost = dir.join("journal-test-lost.txt");
+    let orphan = dir.join("journal-test-orphan.txt");
+    fs::write(&broken, vec![0u8; 100]).unwrap();
+    fs::write(
+        &kept,
+        "version=3\nstate=cleanup-skipped-durability\nsource=D:\\a\nbackup=D:\\k\n",
+    )
+    .unwrap();
+    fs::write(&lost, "version=3\nstate=link-lost\nsource=D:\\a\nbackup=D:\\k\n").unwrap();
+    fs::write(&orphan, "version=3\nstate=relink-failed-leftover\nsource=D:\\b\nbackup=D:\\m\n").unwrap();
+    let journals = engine::unfinished_journals();
+    let broken_entry = journals.iter().find(|journal| journal.path == broken);
+    let kept_entry = journals.iter().find(|journal| journal.path == kept);
+    let lost_entry = journals.iter().find(|journal| journal.path == lost);
+    let orphan_entry = journals.iter().find(|journal| journal.path == orphan);
+    assert_eq!(broken_entry.map(|journal| journal.state.as_str()), Some("unreadable"));
+    assert_eq!(
+        broken_entry.map(|journal| journal.state_text()),
+        Some("запись журнала не читается")
+    );
+    assert_eq!(kept_entry.map(|journal| journal.state.as_str()), Some("cleanup-skipped-durability"));
+    assert_eq!(kept_entry.map(|journal| journal.state_text()), Some("резерв сохранён намеренно"));
+    assert_eq!(lost_entry.map(|journal| journal.state.as_str()), Some("link-lost"));
+    assert_eq!(
+        lost_entry.map(|journal| journal.state_text()),
+        Some("ссылка перестала работать, резерв сохранён")
+    );
+    assert_eq!(orphan_entry.map(|journal| journal.state.as_str()), Some("relink-failed-leftover"));
+    assert_eq!(
+        orphan_entry.map(|journal| journal.state_text()),
+        Some("исходное имя не вернулось, данные в двух местах")
+    );
+    for path in [&broken, &kept, &lost, &orphan] {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[test]
+fn failure_after_create_still_cleans_the_staging() {
+    let root = temp_root();
+    require_symlinks(&root);
+    let (source, _dest_parent, plan) = prepare(&root);
+    let faults = Faults { copy_failure_after_create: true, ..Default::default() };
+    let outcome = engine::execute(&plan, None, &faults);
+    assert!(!outcome.ok);
+    assert!(outcome.detail.contains("после создания"), "{}", outcome.detail);
+    // The file was created before the failure, so the object must already be registered: nothing
+    // of the temporary folder may stay behind.
+    assert!(!win::path_exists(&plan.staging), "staging must be removed (leftover: {})", outcome.leftover);
+    assert!(outcome.leftover.is_empty(), "unexpected leftover: {}", outcome.leftover);
+    assert!(source.join("file.txt").exists());
     cleanup(&root);
 }

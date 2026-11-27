@@ -5,16 +5,21 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF,
-    ERROR_MORE_DATA, ERROR_SUCCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NOT_SUPPORTED, ERROR_SUCCESS, FILETIME,
+    HANDLE, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SetNamedSecurityInfoW};
+use windows_sys::Win32::Globalization::CompareStringOrdinal;
+use windows_sys::Win32::Security::Authorization::{
+    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SetSecurityInfo,
+};
 use windows_sys::Win32::Security::{
-    ACL, GetAce, GetAclInformation, GetSecurityDescriptorControl, ACL_SIZE_INFORMATION, ACL_REVISION,
-    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    ACL, GetAce, GetAclInformation, GetSecurityDescriptorControl, ACE_HEADER, ACL_REVISION,
+    ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     SECURITY_DESCRIPTOR_CONTROL, SE_DACL_PROTECTED,
 };
 
@@ -22,16 +27,26 @@ pub const SE_FILE_OBJECT: i32 = 1;
 pub type Pacl = *mut ACL;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, CreateHardLinkW, DeleteFileW, FileStreamInfo, FlushFileBuffers, GetDiskFreeSpaceExW, GetDriveTypeW,
-    GetFileAttributesW, GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    GetVolumeInformationW, GetVolumePathNameW, MoveFileExW, SetFileAttributesW, SetFileTime, BY_HANDLE_FILE_INFORMATION,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STREAM_INFO, FILE_WRITE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING,
-    OPEN_EXISTING,
+    CreateFileW, CreateHardLinkW, DeleteFileW, FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx,
+    FileStreamInfo, FlushFileBuffers, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileAttributesW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationW,
+    GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, MoveFileExW, SetFileAttributesW, SetFileInformationByHandle,
+    SetFileTime, BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_DISPOSITION_FLAG_DELETE,
+    FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+    FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 pub const INVALID: HANDLE = INVALID_HANDLE_VALUE;
+
+/// Access rights used by the guarded delete path.
+pub const DELETE_ACCESS: u32 = 0x0001_0000;
+pub const READ_DATA_ACCESS: u32 = 0x0001;
+pub const READ_ATTRIBUTES_ACCESS: u32 = 0x0000_0080;
+pub const WRITE_ATTRIBUTES_ACCESS: u32 = 0x0000_0100;
+pub const WRITE_DAC_ACCESS: u32 = 0x0004_0000;
 
 pub fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(std::iter::once(0)).collect()
@@ -126,15 +141,50 @@ pub fn canonical(path: &str) -> Option<String> {
     if handle == INVALID {
         return None;
     }
-    let mut buffer = vec![0u16; 1024];
-    let length = unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
-    close(handle);
-    if length == 0 || length as usize >= buffer.len() {
-        return None;
+    let mut size = 512usize;
+    let mut text = None;
+    // The final path can be longer than the input: grow the buffer until the API fits into it.
+    while size <= 32 * 1024 {
+        let mut buffer = vec![0u16; size];
+        let length = unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+        if length == 0 {
+            break;
+        }
+        if (length as usize) < buffer.len() {
+            buffer.truncate(length as usize);
+            text = Some(strip_long_prefix(&String::from_utf16_lossy(&buffer)));
+            break;
+        }
+        size = (length as usize) + 1;
     }
-    buffer.truncate(length as usize);
-    let text = String::from_utf16_lossy(&buffer);
-    Some(strip_long_prefix(&text))
+    close(handle);
+    text
+}
+
+/// Compares two paths the way NTFS compares names: case-insensitively by the Windows upcase table.
+pub fn equal_paths(left: &str, right: &str) -> bool {
+    let left_wide = wide(left);
+    let right_wide = wide(right);
+    let result = unsafe {
+        CompareStringOrdinal(left_wide.as_ptr(), (left_wide.len() - 1) as i32, right_wide.as_ptr(),
+                             (right_wide.len() - 1) as i32, 1)
+    };
+    result == 2 // CSTR_EQUAL
+}
+
+/// True when `child` lies inside `parent`. Compares byte slices, so a multi-byte character can
+/// never be cut in half.
+pub fn under_prefix(child: &str, parent: &str) -> bool {
+    if parent.is_empty() || child.len() <= parent.len() {
+        return false;
+    }
+    let child_bytes = child.as_bytes();
+    let parent_bytes = parent.as_bytes();
+    if !child_bytes[..parent_bytes.len()].eq_ignore_ascii_case(parent_bytes) {
+        return false;
+    }
+    let next = child_bytes[parent_bytes.len()];
+    parent_bytes.ends_with(b"\\") || next == b'\\'
 }
 
 pub struct FileId {
@@ -147,16 +197,22 @@ pub struct FileId {
     pub size: u64,
 }
 
-pub fn file_info(path: &str, no_follow: bool) -> Option<FileId> {
-    let flags = FILE_FLAG_BACKUP_SEMANTICS | if no_follow { FILE_FLAG_OPEN_REPARSE_POINT } else { 0 };
-    let handle = open(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                      OPEN_EXISTING, flags);
-    if handle == INVALID {
-        return None;
+/// Stable identity of one object on one volume. Re-checked before every change.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Hash)]
+pub struct ObjectId {
+    pub serial: u64,
+    pub index: u64,
+}
+
+impl FileId {
+    pub fn id(&self) -> ObjectId {
+        ObjectId { serial: self.serial, index: self.index }
     }
+}
+
+fn info_of(handle: HANDLE) -> Option<FileId> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
-    close(handle);
     if ok == 0 {
         return None;
     }
@@ -169,6 +225,178 @@ pub fn file_info(path: &str, no_follow: bool) -> Option<FileId> {
         attrs: info.dwFileAttributes,
         size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
     })
+}
+
+pub fn file_info(path: &str, no_follow: bool) -> Option<FileId> {
+    let flags = FILE_FLAG_BACKUP_SEMANTICS | if no_follow { FILE_FLAG_OPEN_REPARSE_POINT } else { 0 };
+    let handle = open(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      OPEN_EXISTING, flags);
+    if handle == INVALID {
+        return None;
+    }
+    let info = info_of(handle);
+    close(handle);
+    info
+}
+
+pub fn object_id(path: &str, no_follow: bool) -> Option<ObjectId> {
+    file_info(path, no_follow).map(|info| info.id())
+}
+
+/// An owned handle. Every check and the change that follows run on the same object, so a name
+/// that is swapped after the check cannot redirect the change.
+pub struct Guard {
+    handle: HANDLE,
+}
+
+impl Guard {
+    pub fn open(path: &str, access: u32, follow_reparse: bool) -> Result<Guard, u32> {
+        let flags = FILE_FLAG_BACKUP_SEMANTICS | if follow_reparse { 0 } else { FILE_FLAG_OPEN_REPARSE_POINT };
+        let handle = open(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING, flags);
+        if handle == INVALID {
+            Err(last_error())
+        } else {
+            Ok(Guard { handle })
+        }
+    }
+
+    /// Opens an object for a change that must not be renamed meanwhile: the handle is shared for
+    /// read and write only, so the name cannot be moved or replaced while it is held.
+    pub fn open_held(path: &str, access: u32) -> Result<Guard, u32> {
+        let flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+        let handle = open(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING, flags);
+        if handle == INVALID {
+            Err(last_error())
+        } else {
+            Ok(Guard { handle })
+        }
+    }
+
+    /// Creates a new file and keeps it open with no sharing, so nothing else can read it while
+    /// the data is being written. `write_dac` asks for the right to apply the source DACL before
+    /// the handle is closed.
+    pub fn open_new(path: &str, write_dac: bool) -> Result<Guard, u32> {
+        let name = api(path);
+        let access = GENERIC_WRITE | FILE_WRITE_ATTRIBUTES | if write_dac { WRITE_DAC_ACCESS } else { 0 };
+        let handle = unsafe {
+            CreateFileW(name.as_ptr(), access, 0, std::ptr::null(), 1 /* CREATE_NEW */, 0x80 /* NORMAL */,
+                        std::ptr::null_mut())
+        };
+        if handle == INVALID {
+            Err(last_error())
+        } else {
+            Ok(Guard { handle })
+        }
+    }
+
+    pub fn info(&self) -> Option<FileId> {
+        info_of(self.handle)
+    }
+
+    pub fn id(&self) -> Option<ObjectId> {
+        info_of(self.handle).map(|info| info.id())
+    }
+
+    /// Borrows the handle as a `File`; the guard keeps ownership, so this never closes it twice.
+    pub fn as_file(&self) -> std::mem::ManuallyDrop<std::fs::File> {
+        unsafe {
+            std::mem::ManuallyDrop::new(std::fs::File::from_raw_handle(
+                self.handle as std::os::windows::io::RawHandle,
+            ))
+        }
+    }
+
+    pub fn reparse(&self) -> Result<Reparse, u32> {
+        reparse_of_handle(self.handle)
+    }
+
+    pub fn set_basic(&self, created: u64, modified: u64, accessed: u64, attrs: Option<u32>) -> bool {
+        let mut basic = FILE_BASIC_INFO {
+            CreationTime: created as i64,
+            LastAccessTime: accessed as i64,
+            LastWriteTime: modified as i64,
+            ChangeTime: 0,
+            FileAttributes: 0,
+        };
+        if let Some(value) = attrs {
+            basic.FileAttributes = value;
+        } else if let Some(info) = info_of(self.handle) {
+            basic.FileAttributes = info.attrs;
+        }
+        set_basic_info(self.handle, &basic)
+    }
+
+    pub fn set_dacl_from(&self, source: &str) -> bool {
+        copy_dacl_to_handle(source, self.handle)
+    }
+
+    pub fn sync(&self) -> bool {
+        unsafe { FlushFileBuffers(self.handle) != 0 }
+    }
+
+    /// Marks this exact object for deletion. POSIX semantics remove the name immediately and ignore
+    /// a read-only attribute; older systems fall back to delete-on-close.
+    pub fn remove(&mut self) -> Result<(), u32> {
+        delete_by_handle(self.handle)
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        close(self.handle);
+    }
+}
+
+fn set_basic_info(handle: HANDLE, basic: &FILE_BASIC_INFO) -> bool {
+    let ok = unsafe {
+        SetFileInformationByHandle(handle, FileBasicInfo, basic as *const FILE_BASIC_INFO as *const _,
+                                   std::mem::size_of::<FILE_BASIC_INFO>() as u32)
+    };
+    ok != 0
+}
+
+fn delete_by_handle(handle: HANDLE) -> Result<(), u32> {
+    let mut modern = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    let ok = unsafe {
+        SetFileInformationByHandle(handle, FileDispositionInfoEx, &mut modern as *mut _ as *const _,
+                                   std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32)
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    let code = last_error();
+    if code != ERROR_INVALID_PARAMETER && code != ERROR_NOT_SUPPORTED && code != ERROR_INVALID_FUNCTION {
+        return Err(code);
+    }
+    // Older Windows: clear the read-only attribute on this same object, then delete on close.
+    let mut basic = FILE_BASIC_INFO {
+        CreationTime: 0,
+        LastAccessTime: 0,
+        LastWriteTime: 0,
+        ChangeTime: 0,
+        FileAttributes: 0,
+    };
+    let read = unsafe {
+        GetFileInformationByHandleEx(handle, FileBasicInfo, &mut basic as *mut _ as *mut _,
+                                     std::mem::size_of::<FILE_BASIC_INFO>() as u32)
+    };
+    if read != 0 {
+        basic.FileAttributes &= !FILE_ATTRIBUTE_READONLY;
+        set_basic_info(handle, &basic);
+    }
+    let mut legacy = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let ok = unsafe {
+        SetFileInformationByHandle(handle, FileDispositionInfo, &mut legacy as *mut _ as *const _,
+                                   std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32)
+    };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(last_error())
+    }
 }
 
 pub fn set_times(path: &str, created: u64, modified: u64, accessed: u64) -> bool {
@@ -242,12 +470,37 @@ pub fn streams(path: &str) -> Result<Vec<StreamInfo>, u32> {
     }
     let mut result = Vec::new();
     let mut offset = 0usize;
+    // FILE_STREAM_INFO: NextEntryOffset (u32), StreamNameLength (u32), StreamSize (i64),
+    // StreamAllocationSize (i64), then the UTF-16 name. The Rust type ends with
+    // `StreamName: [u16; 1]`, so `size_of` is larger than the offset of the name; 24 is the
+    // documented start of the name bytes.
+    const STREAM_NAME_OFFSET: usize = 24;
     loop {
-        let info = unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_STREAM_INFO) };
-        let name_units = (info.StreamNameLength / 2) as usize;
-        let name: String = unsafe {
-            String::from_utf16_lossy(std::slice::from_raw_parts(info.StreamName.as_ptr(), name_units))
+        const INVALID_DATA: u32 = 0x0000000D;
+        let header = match buffer.get(offset..offset + STREAM_NAME_OFFSET) {
+            Some(value) => value,
+            None => {
+                close(handle);
+                return Err(INVALID_DATA);
+            }
         };
+        let next = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let name_bytes = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let size = u64::from_le_bytes([
+            header[8], header[9], header[10], header[11], header[12], header[13], header[14], header[15],
+        ]);
+        let name_start = offset + STREAM_NAME_OFFSET;
+        let name_end = match name_start.checked_add(name_bytes) {
+            Some(value) if value <= buffer.len() && name_bytes % 2 == 0 => value,
+            _ => {
+                close(handle);
+                return Err(INVALID_DATA);
+            }
+        };
+        let units: Vec<u16> = buffer[name_start..name_end].chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let name = String::from_utf16_lossy(&units);
         if name != "::$DATA" {
             let mut clean = name.clone();
             if clean.starts_with(':') {
@@ -256,12 +509,18 @@ pub fn streams(path: &str) -> Result<Vec<StreamInfo>, u32> {
             if let Some(stripped) = clean.strip_suffix(":$DATA") {
                 clean = stripped.to_string();
             }
-            result.push(StreamInfo { name: clean, size: info.StreamSize as u64 });
+            result.push(StreamInfo { name: clean, size });
         }
-        if info.NextEntryOffset == 0 {
+        if next == 0 {
             break;
         }
-        offset += info.NextEntryOffset as usize;
+        offset = match offset.checked_add(next) {
+            Some(value) if value < buffer.len() => value,
+            _ => {
+                close(handle);
+                return Err(INVALID_DATA);
+            }
+        };
     }
     close(handle);
     Ok(result)
@@ -279,50 +538,73 @@ pub struct Reparse {
     pub raw: Vec<u8>,
 }
 
-fn read_unicode(raw: &[u8], base: usize, offset: usize, length: usize) -> String {
-    if length == 0 || offset + length > raw.len().saturating_sub(base) {
-        return String::new();
+fn read_unicode(raw: &[u8], base: usize, offset: usize, length: usize) -> Result<String, u32> {
+    // 0x1B: ERROR_INVALID_DATA - a malformed reparse buffer must never be read past its end.
+    const INVALID_DATA: u32 = 0x0000000D;
+    if length % 2 != 0 {
+        return Err(INVALID_DATA);
+    }
+    let end = base.checked_add(offset).and_then(|start| start.checked_add(length)).ok_or(INVALID_DATA)?;
+    if end > raw.len() {
+        return Err(INVALID_DATA);
     }
     let start = base + offset;
-    let units: Vec<u16> =
-        unsafe { std::slice::from_raw_parts(raw[start..].as_ptr() as *const u16, length / 2) }.to_vec();
-    String::from_utf16_lossy(&units)
+    let units: Vec<u16> = raw[start..end].chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    Ok(String::from_utf16_lossy(&units))
 }
 
-pub fn read_reparse(path: &str) -> Result<Reparse, u32> {
-    let handle = open(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    if handle == INVALID {
-        return Err(last_error());
-    }
+fn reparse_of_handle(handle: HANDLE) -> Result<Reparse, u32> {
     let mut buffer = vec![0u8; 16 * 1024];
     let mut returned: u32 = 0;
     let ok = unsafe {
         DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, std::ptr::null(), 0, buffer.as_mut_ptr() as *mut _,
                         buffer.len() as u32, &mut returned, std::ptr::null_mut())
     };
-    close(handle);
     if ok == 0 {
         return Err(last_error());
     }
-    buffer.truncate(returned as usize);
+    let used = (returned as usize).min(buffer.len());
+    parse_reparse(&buffer[..used])
+}
+
+fn parse_reparse(buffer: &[u8]) -> Result<Reparse, u32> {
+    const INVALID_DATA: u32 = 0x0000000D;
     if buffer.len() < 8 {
-        return Err(0);
+        return Err(INVALID_DATA);
     }
     let tag = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-    let (_base, substitute, relative) = if tag == IO_REPARSE_TAG_SYMLINK && buffer.len() >= 20 {
+    let size = u16::from_le_bytes([buffer[4], buffer[5]]) as usize;
+    // The declared block must agree with the data we actually received.
+    if size < 8 || size > buffer.len() {
+        return Err(INVALID_DATA);
+    }
+    let (base, substitute, relative) = if tag == IO_REPARSE_TAG_SYMLINK {
+        if size < 20 {
+            return Err(INVALID_DATA);
+        }
         let offset = u16::from_le_bytes([buffer[8], buffer[9]]) as usize;
         let length = u16::from_le_bytes([buffer[10], buffer[11]]) as usize;
         let flags = u32::from_le_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]);
-        (20usize, read_unicode(&buffer, 20, offset, length), (flags & 1) != 0)
-    } else if tag == IO_REPARSE_TAG_MOUNT_POINT && buffer.len() >= 16 {
+        (20usize, read_unicode(buffer, 20, offset, length)?, (flags & 1) != 0)
+    } else if tag == IO_REPARSE_TAG_MOUNT_POINT {
+        if size < 16 {
+            return Err(INVALID_DATA);
+        }
         let offset = u16::from_le_bytes([buffer[8], buffer[9]]) as usize;
         let length = u16::from_le_bytes([buffer[10], buffer[11]]) as usize;
-        (16usize, read_unicode(&buffer, 16, offset, length), false)
+        (16usize, read_unicode(buffer, 16, offset, length)?, false)
     } else {
-        return Err(0);
+        return Err(INVALID_DATA);
     };
-    Ok(Reparse { tag, substitute, relative, raw: buffer })
+    let _ = base;
+    Ok(Reparse { tag, substitute, relative, raw: buffer[..size].to_vec() })
+}
+
+pub fn read_reparse(path: &str) -> Result<Reparse, u32> {
+    let guard = Guard::open(path, FILE_READ_ATTRIBUTES, false)?;
+    guard.reparse()
 }
 
 pub fn write_junction(dir: &str, raw: &[u8]) -> bool {
@@ -351,9 +633,12 @@ pub fn normalize_target(target: &str) -> String {
     strip_long_prefix(target)
 }
 
+/// Canonical signature of a DACL. Hashing every ACE's raw bytes covers the mask, the SID and every
+/// other ACE kind, so two different ACLs cannot collapse into one short signature.
 fn acl_signature_from(acl: Pacl) -> String {
+    use sha2::{Digest, Sha256};
     if acl.is_null() {
-        return "<null>".to_string();
+        return "none".to_string();
     }
     let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32;
@@ -361,47 +646,32 @@ fn acl_signature_from(acl: Pacl) -> String {
         GetAclInformation(acl, &mut info as *mut _ as *mut _, size, windows_sys::Win32::Security::AclSizeInformation)
     };
     if ok == 0 {
-        return "<unreadable>".to_string();
+        return "unreadable".to_string();
     }
-    let mut signature = String::new();
+    let mut hasher = Sha256::new();
+    hasher.update(b"acl-v1");
     for index in 0..info.AceCount {
         let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
         if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
-            return "<unreadable-ace>".to_string();
+            return "unreadable".to_string();
         }
-        let header = unsafe { &*(ace as *const windows_sys::Win32::Security::ACE_HEADER) };
-        let flags = header.AceFlags & !0x10;
-        signature.push_str(&format!("{}|{}|", header.AceType, flags));
-        match header.AceType {
-            0 | 1 => {
-                let allowed = unsafe { &*(ace as *const windows_sys::Win32::Security::ACCESS_ALLOWED_ACE) };
-                let sid = unsafe { (ace as *const u8).add(8) } as *mut std::ffi::c_void;
-                signature.push_str(&format!("{}|{};", allowed.Mask, sid_text(sid)));
-            }
-            _ => signature.push_str("opaque;"),
+        let header = unsafe { &*(ace as *const ACE_HEADER) };
+        let ace_size = header.AceSize as usize;
+        if ace_size < std::mem::size_of::<ACE_HEADER>() || ace_size > 64 * 1024 {
+            return "unreadable".to_string();
         }
+        let bytes = unsafe { std::slice::from_raw_parts(ace as *const u8, ace_size) };
+        let mut normalized = bytes.to_vec();
+        // ACE_HEADER layout: AceType (0), AceFlags (1), AceSize (2..4). Dropping only the inherited
+        // flag makes an inherited ACE and the same ACE copied as explicit compare equal.
+        normalized[1] &= !0x10;
+        hasher.update((ace_size as u32).to_le_bytes());
+        hasher.update(&normalized);
     }
-    signature
+    format!("{:x}", hasher.finalize())
 }
 
-fn sid_text(sid: *mut std::ffi::c_void) -> String {
-    let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
-    let ok = unsafe { windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW(sid, &mut text) };
-    if ok == 0 || text.is_null() {
-        return "?".to_string();
-    }
-    let mut length = 0usize;
-    while unsafe { *text.add(length) } != 0 {
-        length += 1;
-    }
-    let result = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
-    unsafe {
-        LocalFree(text as *mut _);
-    }
-    result
-}
-
-pub fn acl_signature(path: &str) -> Option<String> {
+fn local_dacl(path: &str) -> Option<(Pacl, PSECURITY_DESCRIPTOR, bool)> {
     let name = api(path);
     let mut acl: Pacl = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -412,36 +682,20 @@ pub fn acl_signature(path: &str) -> Option<String> {
     if result != ERROR_SUCCESS as u32 {
         return None;
     }
-    let signature = acl_signature_from(acl);
-    unsafe {
-        LocalFree(descriptor as *mut _);
+    let mut protected = false;
+    if !descriptor.is_null() {
+        let mut control: SECURITY_DESCRIPTOR_CONTROL = 0;
+        let mut revision: u32 = 0;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } != 0 {
+            protected = (control & SE_DACL_PROTECTED) != 0;
+        }
     }
-    Some(signature)
+    Some((acl, descriptor, protected))
 }
 
-pub fn apply_acl(source: &str, target: &str) -> bool {
-    let source_name = api(source);
-    let mut acl: Pacl = std::ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    let result = unsafe {
-        GetNamedSecurityInfoW(source_name.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(),
-                              std::ptr::null_mut(), &mut acl, std::ptr::null_mut(), &mut descriptor)
-    };
-    if result != ERROR_SUCCESS as u32 {
-        return false;
-    }
-    if acl.is_null() {
-        // A source without a DACL (NULL) must stay NULL, but protected against inheritance.
-        let mut target_name = api(target);
-        let result = unsafe {
-            SetNamedSecurityInfoW(target_name.as_mut_ptr(), SE_FILE_OBJECT,
-                                  DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                                  std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
-                                  std::ptr::null_mut())
-        };
-        unsafe { LocalFree(descriptor as *mut _) };
-        return result == ERROR_SUCCESS as u32;
-    }
+/// Builds a protected copy of a DACL in an aligned buffer and returns it with the storage that
+/// keeps it alive: the ACEs are copied so the target does not inherit extra rights.
+fn protected_copy(acl: Pacl) -> Option<Vec<u32>> {
     let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32;
     if unsafe {
@@ -449,67 +703,149 @@ pub fn apply_acl(source: &str, target: &str) -> bool {
                           windows_sys::Win32::Security::AclSizeInformation)
     } == 0
     {
-        unsafe { LocalFree(descriptor as *mut _) };
-        return false;
+        return None;
     }
-    // Copy the ACEs into a fresh protected ACL so the target does not inherit extra rights.
-    // The buffer is a Vec<u32> so the ACL always stays 4-byte aligned.
     let capacity = (info.AclBytesInUse + 512 + 3) & !3;
     let mut storage = vec![0u32; (capacity as usize) / 4];
+    // The buffer is a Vec<u32> so the ACL always stays 4-byte aligned.
     let built = storage.as_mut_ptr() as Pacl;
     if unsafe { windows_sys::Win32::Security::InitializeAcl(built, capacity, ACL_REVISION) } == 0 {
-        unsafe { LocalFree(descriptor as *mut _) };
-        return false;
+        return None;
     }
     for index in 0..info.AceCount {
         let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
         if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
-            continue;
+            return None;
         }
-        let header = unsafe { &*(ace as *const windows_sys::Win32::Security::ACE_HEADER) };
-        if (header.AceSize as usize) < std::mem::size_of::<windows_sys::Win32::Security::ACE_HEADER>() {
-            continue;
+        let header = unsafe { &*(ace as *const ACE_HEADER) };
+        let ace_size = header.AceSize as usize;
+        if ace_size < std::mem::size_of::<ACE_HEADER>() || ace_size > 64 * 1024 {
+            return None;
         }
-        let mut bytes = unsafe { std::slice::from_raw_parts(ace as *const u8, header.AceSize as usize) }.to_vec();
-        // ACE_HEADER layout: AceType (0), AceFlags (1), AceSize (2..4). Drop only the inherited flag.
+        let mut bytes = unsafe { std::slice::from_raw_parts(ace as *const u8, ace_size) }.to_vec();
         bytes[1] &= !0x10;
         let added = unsafe {
             windows_sys::Win32::Security::AddAce(built, ACL_REVISION, u32::MAX, bytes.as_ptr() as *const _,
-                                                 header.AceSize as u32)
+                                                 ace_size as u32)
         };
         if added == 0 {
-            unsafe { LocalFree(descriptor as *mut _) };
-            return false;
+            return None;
         }
     }
-    let mut target_name = api(target);
+    Some(storage)
+}
+
+pub fn acl_signature(path: &str) -> Option<String> {
+    let (acl, descriptor, _) = local_dacl(path)?;
+    let signature = acl_signature_from(acl);
+    unsafe {
+        LocalFree(descriptor as *mut _);
+    }
+    Some(signature)
+}
+
+/// True when the DACL carries at least one ACE that was set explicitly rather than inherited.
+/// Returns `None` when the DACL cannot be read: "unknown" must never look like "nothing to lose".
+pub fn acl_has_explicit(path: &str) -> Option<bool> {
+    let (acl, descriptor, _) = local_dacl(path)?;
+    let mut explicit = false;
+    let mut readable = true;
+    if !acl.is_null() {
+        let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32;
+        if unsafe {
+            GetAclInformation(acl, &mut info as *mut _ as *mut _, size,
+                              windows_sys::Win32::Security::AclSizeInformation)
+        } != 0
+        {
+            for index in 0..info.AceCount {
+                let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+                if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
+                    readable = false;
+                    break;
+                }
+                let header = unsafe { &*(ace as *const ACE_HEADER) };
+                if (header.AceFlags & 0x10) == 0 {
+                    explicit = true;
+                    break;
+                }
+            }
+        } else {
+            readable = false;
+        }
+    }
+    unsafe {
+        LocalFree(descriptor as *mut _);
+    }
+    if readable {
+        Some(explicit)
+    } else {
+        None
+    }
+}
+
+fn set_handle_dacl(source_acl: Pacl, handle: HANDLE) -> bool {
     let result = unsafe {
-        SetNamedSecurityInfoW(target_name.as_mut_ptr(), SE_FILE_OBJECT,
-                              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                              std::ptr::null_mut(), std::ptr::null_mut(), built, std::ptr::null_mut())
+        if source_acl.is_null() {
+            SetSecurityInfo(handle, SE_FILE_OBJECT,
+                            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
+        } else {
+            match protected_copy(source_acl) {
+                None => return false,
+                Some(storage) => SetSecurityInfo(handle, SE_FILE_OBJECT,
+                                                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                                 std::ptr::null_mut(), std::ptr::null_mut(),
+                                                 storage.as_ptr() as Pacl, std::ptr::null()),
+            }
+        }
+    };
+    result == ERROR_SUCCESS as u32
+}
+
+pub fn apply_acl(source: &str, target: &str) -> bool {
+    let Some((acl, descriptor, _)) = local_dacl(source) else { return false };
+    let result = unsafe {
+        if acl.is_null() {
+            let mut target_name = api(target);
+            SetNamedSecurityInfoW(target_name.as_mut_ptr(), SE_FILE_OBJECT,
+                                  DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                  std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+                                  std::ptr::null_mut())
+        } else {
+            match protected_copy(acl) {
+                None => {
+                    LocalFree(descriptor as *mut _);
+                    return false;
+                }
+                Some(storage) => {
+                    let mut target_name = api(target);
+                    SetNamedSecurityInfoW(target_name.as_mut_ptr(), SE_FILE_OBJECT,
+                                          DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                          std::ptr::null_mut(), std::ptr::null_mut(),
+                                          storage.as_ptr() as Pacl, std::ptr::null_mut())
+                }
+            }
+        }
     };
     unsafe { LocalFree(descriptor as *mut _) };
     result == ERROR_SUCCESS as u32
 }
 
+/// Applies the source DACL to an already open target handle. Used while the new file is still held
+/// exclusively, so the data is never readable with the inherited (possibly wider) rights.
+fn copy_dacl_to_handle(source: &str, target: HANDLE) -> bool {
+    let Some((acl, descriptor, _)) = local_dacl(source) else { return false };
+    let applied = set_handle_dacl(acl, target);
+    unsafe { LocalFree(descriptor as *mut _) };
+    applied
+}
+
 pub fn dacl_protected(path: &str) -> bool {
-    let name = api(path);
-    let mut acl: Pacl = std::ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    let result = unsafe {
-        GetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(),
-                              std::ptr::null_mut(), &mut acl, std::ptr::null_mut(), &mut descriptor)
-    };
-    if result != ERROR_SUCCESS as u32 {
-        return false;
-    }
-    let mut control: SECURITY_DESCRIPTOR_CONTROL = 0;
-    let mut revision: u32 = 0;
-    let ok = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
-    unsafe {
-        LocalFree(descriptor as *mut _);
-    }
-    ok != 0 && (control & SE_DACL_PROTECTED) != 0
+    local_dacl(path).map(|(_, descriptor, protected)| {
+        unsafe { LocalFree(descriptor as *mut _) };
+        protected
+    }).unwrap_or(false)
 }
 
 pub fn volume_root(path: &str) -> Option<String> {
@@ -556,11 +892,57 @@ pub fn free_space(path: &str) -> Option<u64> {
     }
 }
 
+/// Device path of the volume that contains `path`, plus its serial number.
+/// The identity comes from the mount point reported by Windows, never from the first two
+/// characters of a path, so a volume mounted into a folder is handled correctly.
+pub fn volume_device(path: &str) -> Option<(String, u64)> {
+    let root = volume_root(path)?;
+    let mut buffer = vec![0u16; 512];
+    let ok = unsafe {
+        GetVolumeNameForVolumeMountPointW(wide(&root).as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
+    };
+    let device = if ok != 0 {
+        let length = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+        String::from_utf16_lossy(&buffer[..length])
+    } else if is_drive_root(&root) {
+        // Only a real drive root may fall back to `\\.\X:`; for a folder mount point the first two
+        // characters name the host drive, not the volume that holds the data.
+        format!("\\\\.\\{}", &root[..2])
+    } else {
+        return None;
+    };
+    let serial = volume_serial(path)?;
+    Some((device, serial))
+}
+
+fn is_drive_root(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2
+        && bytes.len() <= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'\\')
+}
+
+pub fn volume_serial(path: &str) -> Option<u64> {
+    let root = volume_root(path)?;
+    let mut serial: u32 = 0;
+    let ok = unsafe {
+        GetVolumeInformationW(wide(&root).as_ptr(), std::ptr::null_mut(), 0, &mut serial,
+                              std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0)
+    };
+    if ok == 0 {
+        None
+    } else {
+        Some(serial as u64)
+    }
+}
+
+/// Flushes the volume that contains `path`. Requires a volume handle, which usually needs elevation.
 pub fn flush_volume(path: &str) -> bool {
-    let Some(root) = volume_root(path) else { return false };
-    let device = format!("\\\\.\\{}", root.chars().take(2).collect::<String>());
+    let Some((device, _)) = volume_device(path) else { return false };
     // Device paths must reach CreateFileW as written: a `\\?\` prefix turns `\\.\C:` into a bad name.
-    let name = wide(&device);
+    let name = wide(&device.trim_end_matches('\\'));
     let handle = unsafe {
         CreateFileW(name.as_ptr(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(),
                     OPEN_EXISTING, 0, std::ptr::null_mut())
@@ -573,10 +955,26 @@ pub fn flush_volume(path: &str) -> bool {
     ok != 0
 }
 
+/// Creates a directory. An existing directory counts as success only where the caller already
+/// proved that the object is its own; new objects use `create_dir_new`.
 pub fn create_dir(path: &str) -> bool {
     let name = api(path);
     let ok = unsafe { windows_sys::Win32::Storage::FileSystem::CreateDirectoryW(name.as_ptr(), std::ptr::null()) };
     ok != 0 || last_error() == ERROR_ALREADY_EXISTS
+}
+
+/// Creates a directory that must not exist yet: an existing object is a failure, not a success.
+pub fn create_dir_new(path: &str) -> bool {
+    let name = api(path);
+    unsafe { windows_sys::Win32::Storage::FileSystem::CreateDirectoryW(name.as_ptr(), std::ptr::null()) != 0 }
+}
+
+/// Renames a path and waits until the change is recorded on disk.
+pub fn move_path_through(from: &str, to: &str, replace: bool) -> bool {
+    let from_name = api(from);
+    let to_name = api(to);
+    let flags = MOVEFILE_WRITE_THROUGH | if replace { MOVEFILE_REPLACE_EXISTING } else { 0 };
+    unsafe { MoveFileExW(from_name.as_ptr(), to_name.as_ptr(), flags) != 0 }
 }
 
 pub fn path_exists(path: &str) -> bool {
@@ -619,7 +1017,6 @@ pub fn error_text(code: u32) -> String {
     format!("code {}: {}", code, text)
 }
 
-pub const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 pub const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
