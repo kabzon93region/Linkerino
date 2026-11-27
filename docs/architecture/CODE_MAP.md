@@ -39,7 +39,7 @@
 - `cargo test --release -- --test-threads=1`: 27 интеграционных тестов движка и 9 юнит-тестов (тема, разбор команд), все проходят (NTFS, Windows 10 22H2, права администратора). Без прав на ссылку тесты падают с явным сообщением, а не пропускаются молча; тестовые журналы пишутся во временную папку через `LINKERINO_JOURNAL_DIR` и не попадают в профиль пользователя.
 - `basic_move` требует удаления резерва после успеха; `flush_failure_keeps_the_backup` подтверждает ветку «запись не подтверждена»; `plan_is_revalidated_before_any_change` — что подменённая по тому же пути папка не трогается; `interrupted_transfer_keeps_a_journal`, `successful_transfer_leaves_no_journal` и `unreadable_and_kept_backup_journals_are_reported` — состояния журнала и его нечитаемость.
 - `scripts/smoke-rust.ps1`: CLI (`--help`, `--version`, `--plan`, `--transfer --json`, `--journals`, коды 2 для ошибок), перенос через `--transfer`, ссылка и данные на месте, окно создаётся и закрывается, три снимка окна сохраняются.
-- Сборка release: `rust\target\release\Linkerino.exe`, ~3,1 МБ, без импорта `VCRUNTIME140.dll` (статический CRT). Иконка и сведения о версии встроены в EXE, окно получает ту же иконку.
+- Сборка release: `rust\target\release\Linkerino.exe`, 3 377 664 байта (≈3,2 МБ), без импорта `VCRUNTIME140.dll` (статический CRT). Иконка и сведения о версии встроены в EXE, окно получает ту же иконку.
 
 ### Не проверено на Rust
 

@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   windows:
     runs-on: windows-2022
@@ -38,14 +41,17 @@ jobs:
 
       - name: Build
         working-directory: rust
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Tests
         working-directory: rust
-        run: cargo test --release -- --test-threads=1
+        run: cargo test --locked --release -- --test-threads=1
 
       - name: Smoke (CLI transfer)
         run: powershell -ExecutionPolicy Bypass -File scripts\smoke-rust.ps1 -SkipGui
+
+      - name: Checksum
+        run: certutil -hashfile rust\target\release\Linkerino.exe SHA256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
