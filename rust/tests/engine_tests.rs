@@ -644,3 +644,85 @@ fn failure_after_create_still_cleans_the_staging() {
     assert!(source.join("file.txt").exists());
     cleanup(&root);
 }
+
+#[test]
+fn junction_inside_tree_is_recreated() {
+    let root = temp_root();
+    require_symlinks(&root);
+    let source = root.join("src").join("Data");
+    let target = root.join("target-outside");
+    let dest_parent = root.join("dest");
+    write(&target.join("file.txt"), b"junction payload");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest_parent).unwrap();
+    let link = source.join("mount");
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J", &link.to_string_lossy(), &target.to_string_lossy()])
+        .status()
+        .expect("mklink");
+    assert!(status.success(), "could not create a junction for the test");
+    let plan = engine::build_plan(&source.to_string_lossy(), &dest_parent.to_string_lossy());
+    assert!(plan.valid, "{}", plan.error);
+    let outcome = engine::execute(&plan, None, &Faults::default());
+    assert!(outcome.ok, "{} / {}", outcome.message, outcome.detail);
+    let copied = Path::new(&plan.dest_final).join("mount");
+    assert!(win::is_reparse(&copied.to_string_lossy()), "junction was not recreated");
+    assert!(read(&copied.join("file.txt")) == b"junction payload");
+    cleanup(&root);
+}
+
+#[test]
+fn relative_link_inside_tree_points_at_the_new_place() {
+    let root = temp_root();
+    require_symlinks(&root);
+    let source = root.join("src").join("Data");
+    let dest_parent = root.join("dest");
+    write(&source.join("data").join("file.txt"), b"relative payload");
+    fs::create_dir_all(&dest_parent).unwrap();
+    let link = source.join("inner");
+    // A relative target: it must be recreated as an absolute path to the new location.
+    win::symlink(&link.to_string_lossy(), "data", true).expect("symlink");
+    let plan = engine::build_plan(&source.to_string_lossy(), &dest_parent.to_string_lossy());
+    assert!(plan.valid, "{}", plan.error);
+    let outcome = engine::execute(&plan, None, &Faults::default());
+    assert!(outcome.ok, "{} / {}", outcome.message, outcome.detail);
+    let copied = Path::new(&plan.dest_final).join("inner");
+    assert!(win::is_reparse(&copied.to_string_lossy()));
+    let resolved = win::canonical(&copied.to_string_lossy()).unwrap_or_default();
+    let expected = win::canonical(&win::join(&plan.dest_final, "data")).unwrap_or_default();
+    assert!(resolved.eq_ignore_ascii_case(&expected), "resolved to {}", resolved);
+    assert!(read(&copied.join("file.txt")) == b"relative payload");
+    cleanup(&root);
+}
+
+#[test]
+fn junction_inside_source_points_at_the_new_place() {
+    let root = temp_root();
+    require_symlinks(&root);
+    let source = root.join("src").join("Data");
+    let dest_parent = root.join("dest");
+    write(&source.join("real").join("file.txt"), b"inner junction");
+    fs::create_dir_all(&dest_parent).unwrap();
+    let link = source.join("mount");
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J", &link.to_string_lossy(), &source.join("real").to_string_lossy()])
+        .status()
+        .expect("mklink");
+    assert!(status.success(), "could not create a junction for the test");
+    let plan = engine::build_plan(&source.to_string_lossy(), &dest_parent.to_string_lossy());
+    assert!(plan.valid, "{}", plan.error);
+    let outcome = engine::execute(&plan, None, &Faults::default());
+    assert!(outcome.ok, "{} / {}", outcome.message, outcome.detail);
+    let copied = Path::new(&plan.dest_final).join("mount");
+    assert!(win::is_reparse(&copied.to_string_lossy()));
+    // The junction must be rewritten to the new location, not copied with the old target text.
+    let actual = win::read_reparse(&copied.to_string_lossy()).expect("reparse");
+    let expected = win::join(&plan.dest_final, "real");
+    assert!(
+        win::normalize_target(&actual.substitute).eq_ignore_ascii_case(&expected),
+        "junction still points at {}",
+        actual.substitute
+    );
+    assert!(read(&copied.join("file.txt")) == b"inner junction");
+    cleanup(&root);
+}

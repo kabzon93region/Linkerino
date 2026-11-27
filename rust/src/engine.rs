@@ -120,6 +120,9 @@ struct ReparseLink {
     raw: Vec<u8>,
     link_text: String,
     inside_rel: String,
+    /// True when the link points into the moved folder (or at the folder itself): such a link is
+    /// recreated against the new location, everything else keeps its own target text.
+    internal: bool,
 }
 
 #[derive(Clone, Default)]
@@ -486,8 +489,7 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>, ctx: &m
         .collect();
     for stream in dir.streams.iter_mut() {
         let path = stream_path(&plain, &stream.name);
-        let mut ctx = Ctx::new(None);
-        stream.hash = hash_file(&path, &mut ctx).map_err(|e| format!("Ошибка чтения потока {}: {}", path, e))?;
+        stream.hash = hash_file(&path, ctx).map_err(|e| format!("Ошибка чтения потока {}: {}", path, e))?;
     }
     entries.push(dir);
     let read_dir = match fs::read_dir(&plain) {
@@ -520,25 +522,22 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>, ctx: &m
             let is_dir = attrs & win::FILE_ATTRIBUTE_DIRECTORY != 0;
             let reparse = win::read_reparse(&child_plain)
                 .map_err(|code| format!("Не удалось прочитать ссылку {}: {}", child_plain, win::error_text(code)))?;
-            // Resolve only a relative link: an absolute link keeps its own target text and its
-            // destination is never opened while scanning.
+            let target_text = win::normalize_target(&reparse.substitute);
+            // A link that points into the folder is recreated against the new location; any other
+            // link keeps its own target text. Only a relative link has to be resolved to decide.
             let resolved = if reparse.relative {
                 win::canonical(&child_plain).unwrap_or_default()
             } else {
-                String::new()
+                target_text.clone()
             };
-            let inside_rel = if !resolved.is_empty() && under_or_equal(&resolved, root) {
+            let inside_root = !resolved.is_empty()
+                && (same_path(&resolved, root) || under_or_equal(&resolved, root));
+            let inside_rel = if inside_root && resolved.len() >= root.len() {
                 resolved[root.len()..].trim_start_matches('\\').to_string()
             } else {
                 String::new()
             };
-            let link_text = if reparse.relative && !inside_rel.is_empty() {
-                win::normalize_target(&reparse.substitute)
-            } else if !resolved.is_empty() {
-                resolved.clone()
-            } else {
-                win::normalize_target(&reparse.substitute)
-            };
+            let link_text = if inside_root { resolved.clone() } else { target_text };
             entries.push(Entry {
                 rel: child_rel,
                 is_dir,
@@ -553,6 +552,7 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>, ctx: &m
                     raw: reparse.raw,
                     link_text,
                     inside_rel,
+                    internal: inside_root,
                 }),
                 ..Default::default()
             });
@@ -586,12 +586,10 @@ fn scan_dir(root: &str, rel: &str, depth: u32, entries: &mut Vec<Entry>, ctx: &m
             .collect();
         for stream in file.streams.iter_mut() {
             let path = stream_path(&child_plain, &stream.name);
-            let mut ctx = Ctx::new(None);
-            stream.hash = hash_file(&path, &mut ctx).map_err(|e| format!("Ошибка чтения потока {}: {}", path, e))?;
+            stream.hash = hash_file(&path, ctx).map_err(|e| format!("Ошибка чтения потока {}: {}", path, e))?;
         }
         if file.links > 1 {
-            let mut ctx = Ctx::new(None);
-            file.hash = Some(hash_file(&child_plain, &mut ctx).map_err(|e| format!("Ошибка чтения {}: {}", child_plain, e))?);
+            file.hash = Some(hash_file(&child_plain, ctx).map_err(|e| format!("Ошибка чтения {}: {}", child_plain, e))?);
         }
         entries.push(file);
     }
@@ -802,7 +800,14 @@ fn copy_reparse(
             Some(id) => created.insert(id),
             None => return Err(format!("Не удалось подтвердить каталог junction {}", target)),
         };
-        if !win::write_junction(target, &link.raw) {
+        // An internal junction gets a freshly built block that points at the new location; an
+        // external one is written back exactly as it was.
+        let block = if link.internal {
+            win::junction_block(&link.link_text)
+        } else {
+            link.raw.clone()
+        };
+        if !win::write_junction(target, &block) {
             return Err(format!("Не удалось создать junction {}", target));
         }
         return Ok(());
@@ -858,11 +863,20 @@ fn copy_tree(
         }
     }
     for index in 0..entries.len() {
-        let Some(link) = entries[index].reparse.clone() else { continue };
+        let Some(mut link) = entries[index].reparse.clone() else { continue };
         let target = win::join(&plan.staging, &entries[index].rel);
+        // A link that points into the moved folder must point at the future location of that
+        // object, not at the old path: the old path only works while the source link exists.
+        if link.internal {
+            link.link_text = win::join(&plan.dest_final, &link.inside_rel);
+        }
+        if ctx.cancel_requested() {
+            return Err("Отменено пользователем".into());
+        }
         ctx.item = entries[index].rel.clone();
-        ctx.report(true);
+        ctx.report(false);
         copy_reparse(&target, &link, created)?;
+        entries[index].reparse = Some(link);
     }
     for index in 0..entries.len() {
         if entries[index].is_dir || entries[index].reparse.is_some() {
@@ -871,11 +885,14 @@ fn copy_tree(
         if faults.copy_failure {
             return Err("Тестовый сбой копирования".into());
         }
+        if ctx.cancel_requested() {
+            return Err("Отменено пользователем".into());
+        }
         let rel = entries[index].rel.clone();
         let source = win::join(&plan.source, &rel);
         let target = win::join(&plan.staging, &rel);
         ctx.item = rel.clone();
-        ctx.report(true);
+        ctx.report(false);
         let mut handled = false;
         if let Some(primary) = entries[index].hardlink_primary {
             if caps.hardlinks {
@@ -901,7 +918,7 @@ fn copy_tree(
             }
         }
         ctx.files_done += 1;
-        ctx.report(true);
+        ctx.report(false);
     }
     for index in (0..entries.len()).rev() {
         let entry = &entries[index];
@@ -934,9 +951,13 @@ fn verify_reparse(root: &str, entry: &Entry, caps: &Caps) -> Result<(), String> 
     if actual.tag != link.tag {
         return Err(format!("Тип ссылки не совпадает: {}", plain));
     }
-    let expected = if link.tag == 0xA0000003 {
-        win::normalize_target(&link.substitute)
-    } else if link.link_text.is_empty() {
+    // The kind of the object (file or folder link) must survive the copy.
+    if (attrs & win::FILE_ATTRIBUTE_DIRECTORY != 0) != link.is_dir {
+        return Err(format!("Вид ссылки (файл или каталог) не совпадает: {}", plain));
+    }
+    // `link_text` is exactly what this run created: the future path for an internal link, the
+    // original target text for an external one.
+    let expected = if link.link_text.is_empty() {
         win::normalize_target(&link.substitute)
     } else {
         link.link_text.clone()
@@ -944,12 +965,11 @@ fn verify_reparse(root: &str, entry: &Entry, caps: &Caps) -> Result<(), String> 
     if !win::normalize_target(&actual.substitute).eq_ignore_ascii_case(&expected) {
         return Err(format!("Цель ссылки не совпадает: {} -> {}", plain, actual.substitute));
     }
-    if link.relative && !link.inside_rel.is_empty() {
-        let resolved = win::canonical(&plain).ok_or_else(|| format!("Относительная ссылка не открывается: {}", plain))?;
-        let expected_path = win::join(root, &link.inside_rel);
-        if !win::normalize_target(&resolved).eq_ignore_ascii_case(&expected_path) {
-            return Err(format!("Относительная ссылка ведёт не туда: {}", plain));
-        }
+    // A link that points into the moved folder is recreated absolute against the new location;
+    // every other link keeps the form it had (relative stays relative).
+    let expected_relative = if link.internal { false } else { link.relative };
+    if actual.relative != expected_relative {
+        return Err(format!("Вид ссылки (относительная или абсолютная) не совпадает: {}", plain));
     }
     let _ = caps;
     Ok(())
@@ -997,10 +1017,15 @@ fn verify_entry(root: &str, entry: &Entry, ctx: &mut Ctx, caps: &Caps) -> Result
             if actual.len() != entry.streams.len() {
                 return Err(format!("Набор потоков файла не совпадает: {}", plain));
             }
-            for (index, stream) in entry.streams.iter().enumerate() {
-                if actual[index].name != stream.name {
-                    return Err(format!("Имя потока не совпадает: {}", plain));
-                }
+            // Order is not part of the meaning: names are compared as a set.
+            let mut actual_names: Vec<&str> = actual.iter().map(|stream| stream.name.as_str()).collect();
+            let mut expected_names: Vec<&str> = entry.streams.iter().map(|stream| stream.name.as_str()).collect();
+            actual_names.sort();
+            expected_names.sort();
+            if actual_names != expected_names {
+                return Err(format!("Имена потоков файла не совпадают: {}", plain));
+            }
+            for stream in entry.streams.iter() {
                 let path = stream_path(&plain, &stream.name);
                 let hash = hash_file(&path, ctx).map_err(|e| format!("Ошибка сверки потока {}: {}", path, e))?;
                 if hash != stream.hash {
@@ -1009,11 +1034,23 @@ fn verify_entry(root: &str, entry: &Entry, ctx: &mut Ctx, caps: &Caps) -> Result
             }
         }
     } else {
+        // Directory attributes are compared where the filesystem keeps them; the read-only flag is
+        // not applied to folders, so it is masked out.
+        if !attribute_mask_match(info.attrs, entry.attrs, caps.attr_mask & !win::FILE_ATTRIBUTE_READONLY) {
+            return Err(format!("Атрибуты каталога не совпадают: {}", plain));
+        }
         if caps.dir_streams {
             let actual = win::streams(&plain)
                 .map_err(|code| format!("Не удалось перечислить потоки {}: {}", plain, win::error_text(code)))?;
             if actual.len() != entry.streams.len() {
                 return Err(format!("Набор потоков каталога не совпадает: {}", plain));
+            }
+            let mut actual_names: Vec<&str> = actual.iter().map(|stream| stream.name.as_str()).collect();
+            let mut expected_names: Vec<&str> = entry.streams.iter().map(|stream| stream.name.as_str()).collect();
+            actual_names.sort();
+            expected_names.sort();
+            if actual_names != expected_names {
+                return Err(format!("Имена потоков каталога не совпадают: {}", plain));
             }
             for stream in entry.streams.iter() {
                 let path = stream_path(&plain, &stream.name);
@@ -1033,27 +1070,38 @@ fn verify_entry(root: &str, entry: &Entry, ctx: &mut Ctx, caps: &Caps) -> Result
     Ok(())
 }
 
-fn collect_paths(root: &str) -> Result<Vec<String>, String> {
-    fn walk(root: &str, rel: &str, out: &mut Vec<String>) -> Result<(), String> {
+fn collect_paths(root: &str, ctx: &mut Ctx) -> Result<Vec<String>, String> {
+    fn walk(root: &str, rel: &str, out: &mut Vec<String>, ctx: &mut Ctx) -> Result<(), String> {
+        if ctx.cancel_requested() {
+            return Err("Отменено пользователем".into());
+        }
         out.push(rel.to_string());
         let plain = if rel.is_empty() { root.to_string() } else { win::join(root, rel) };
         let read = fs::read_dir(&plain).map_err(|e| format!("Не удалось прочитать {}: {}", plain, e))?;
         for item in read {
+            if ctx.cancel_requested() {
+                return Err("Отменено пользователем".into());
+            }
             let item = item.map_err(|e| format!("Ошибка чтения {}: {}", plain, e))?;
-            let name = item.file_name().to_string_lossy().to_string();
+            // A lossy name would silently compare a different object than the one on disk.
+            let name = item
+                .file_name()
+                .to_str()
+                .map(|value| value.to_string())
+                .ok_or_else(|| format!("В {} есть имя, которое нельзя прочитать как Unicode", plain))?;
             let child_rel = if rel.is_empty() { name.clone() } else { win::join(rel, &name) };
             let child_plain = win::join(&plain, &name);
             let attrs = win::attributes(&child_plain)
                 .ok_or_else(|| format!("Не удалось прочитать атрибуты {}", child_plain))?;
             out.push(child_rel.clone());
             if attrs & win::FILE_ATTRIBUTE_DIRECTORY != 0 && attrs & win::FILE_ATTRIBUTE_REPARSE_POINT == 0 {
-                walk(root, &child_rel, out)?;
+                walk(root, &child_rel, out, ctx)?;
             }
         }
         Ok(())
     }
     let mut result = Vec::new();
-    walk(root, "", &mut result)?;
+    walk(root, "", &mut result, ctx)?;
     Ok(result)
 }
 
@@ -1066,9 +1114,9 @@ fn describe_path(path: &str) -> String {
 }
 
 /// Compares the actual set of paths with the scanned one: missing and extra objects are both failures.
-fn verify_path_set(root: &str, entries: &[Entry]) -> Result<(), String> {
+fn verify_path_set(root: &str, entries: &[Entry], ctx: &mut Ctx) -> Result<(), String> {
     let mut expected: Vec<String> = entries.iter().map(|entry| entry.rel.clone()).collect();
-    let mut actual = collect_paths(root)?;
+    let mut actual = collect_paths(root, ctx)?;
     expected.sort();
     actual.sort();
     expected.dedup();
@@ -1088,7 +1136,7 @@ fn verify_path_set(root: &str, entries: &[Entry]) -> Result<(), String> {
 fn verify_tree(root: &str, entries: &[Entry], ctx: &mut Ctx, caps: &Caps) -> Result<(), String> {
     // The set check runs first: a missing or extra object also changes folder timestamps,
     // and that report would hide the real reason.
-    verify_path_set(root, entries)?;
+    verify_path_set(root, entries, ctx)?;
     for entry in entries {
         ctx.item = entry.rel.clone();
         ctx.report(false);
@@ -1128,8 +1176,11 @@ fn verify_tree(root: &str, entries: &[Entry], ctx: &mut Ctx, caps: &Caps) -> Res
     Ok(())
 }
 
-fn verify_source_unchanged(plan: &Plan, entries: &[Entry]) -> Result<(), String> {
+fn verify_source_unchanged(plan: &Plan, entries: &[Entry], ctx: &mut Ctx) -> Result<(), String> {
     for entry in entries {
+        if ctx.cancel_requested() {
+            return Err("Отменено пользователем".into());
+        }
         let plain = if entry.rel.is_empty() { plan.source.clone() } else { win::join(&plan.source, &entry.rel) };
         if let Some(link) = &entry.reparse {
             let actual = win::read_reparse(&plain)
@@ -1154,8 +1205,8 @@ fn verify_source_unchanged(plan: &Plan, entries: &[Entry]) -> Result<(), String>
             return Err(format!("Исходный объект изменился во время переноса: {}", plain));
         }
         if !entry.is_dir {
-            let mut ctx = Ctx::new(None);
-            let hash = hash_file(&plain, &mut ctx).map_err(|e| format!("Ошибка сверки {}: {}", plain, e))?;
+            // The same counter as the rest of the pass, so cancellation is noticed while hashing.
+            let hash = hash_file(&plain, ctx).map_err(|e| format!("Ошибка сверки {}: {}", plain, e))?;
             if Some(&hash) != entry.hash.as_ref() {
                 return Err(format!("Содержимое исходного файла изменилось: {}", plain));
             }
@@ -1692,6 +1743,17 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
              format!("Файловая система назначения ({}) не поддерживает ссылки. Выберите диск NTFS.", caps.fs), "failed");
         return outcome;
     }
+    // On a network share the volume serial and file index come from the server and need not be
+    // unique, so two different files could look like one hard-linked object. The source matters as
+    // much as the destination here: the identifiers are read there. Splitting them into separate
+    // copies is the safe choice: content is preserved, only the link count changes.
+    let source_remote = win::volume_info(&plan.source).map(|value| value.remote).unwrap_or(false);
+    let grouped_links = entries.iter().filter(|entry| entry.hardlink_primary.is_some()).count();
+    if caps.remote || source_remote {
+        for entry in entries.iter_mut() {
+            entry.hardlink_primary = None;
+        }
+    }
     // Data-bearing properties are never dropped silently: a destination without streams cannot
     // hold them, so the transfer stops while the original is still untouched.
     let files_with_streams = entries
@@ -1719,10 +1781,12 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
     if !caps.acl && entries.iter().any(|entry| entry.dacl_explicit) {
         notes.push_str("Права доступа: на новом месте их нельзя сохранить, а у источника они заданы явно или не читаются.\n");
     }
-    if !caps.hardlinks {
-        let groups = entries.iter().filter(|entry| entry.hardlink_primary.is_some()).count();
-        if groups > 0 {
-            notes.push_str(&format!("Жёсткие ссылки не сохранены: {} файл(ов) скопированы отдельно.\n", groups));
+    if !caps.hardlinks || caps.remote || source_remote {
+        if grouped_links > 0 {
+            notes.push_str(&format!("Жёсткие ссылки не сохранены: {} файл(ов) скопированы отдельно.\n", grouped_links));
+        }
+        if caps.remote || source_remote {
+            notes.push_str("Сетевое хранилище: жёсткие ссылки не объединяются, чтобы не связать разные файлы.\n");
         }
     }
     outcome.notes = notes;
@@ -1760,6 +1824,8 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
     // Copy.
     ctx.phase = Phase::Copy;
     ctx.item.clear();
+    ctx.bytes_done = 0;
+    ctx.files_done = 0;
     ctx.report(true);
     if let Err(error) = copy_tree(plan, &mut entries, &mut ctx, faults, &caps, &mut created) {
         cleanup_staging(&mut outcome, plan, staging_id, &created);
@@ -1786,9 +1852,10 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
         }
     }
 
-    // Verify.
+    // Verify. Counters are per phase: a mix of copy and verify numbers made the bar jump.
     ctx.phase = Phase::Verify;
     ctx.bytes_done = 0;
+    ctx.files_done = 0;
     ctx.report(true);
     if let Err(error) = verify_tree(&plan.staging, &entries, &mut ctx, &caps) {
         if ctx.cancelled {
@@ -1807,9 +1874,25 @@ pub fn execute(plan: &Plan, sink: Option<&dyn Sink>, faults: &Faults) -> Outcome
         fail(&mut outcome, &journal, "Сверка копии не прошла. Оригинал не изменён.".into(), "Тестовый сбой сверки".into(), "failed");
         return outcome;
     }
-    if let Err(error) = verify_source_unchanged(plan, &entries) {
+    if let Err(error) = verify_source_unchanged(plan, &entries, &mut ctx) {
         cleanup_staging(&mut outcome, plan, staging_id, &created);
+        if ctx.cancelled {
+            outcome.cancelled = true;
+            outcome.message = "Отменено во время повторной проверки. Оригинал на месте.".into();
+            outcome.detail = error.clone();
+            let _ = journal.save("cancelled", &format!("error={}", error));
+            return outcome;
+        }
         fail(&mut outcome, &journal, "Исходная папка изменилась во время переноса. Оригинал не тронут.".into(), error, "failed");
+        return outcome;
+    }
+    // Cancellation is honoured up to this boundary and never after it: once the name starts
+    // changing, the operation either finishes or keeps the backup.
+    if ctx.cancel_requested() {
+        cleanup_staging(&mut outcome, plan, staging_id, &created);
+        outcome.cancelled = true;
+        outcome.message = "Отменено до переключения. Оригинал на месте.".into();
+        let _ = journal.save("cancelled", "cancelled before publish");
         return outcome;
     }
     // The last point where nothing is renamed yet: the record of a verified copy must exist before

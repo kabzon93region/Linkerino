@@ -150,6 +150,11 @@ struct App {
     dest: String,
     preview: String,
     preview_error: String,
+    preview_gen: u64,
+    preview_rx: Option<std::sync::mpsc::Receiver<(u64, String, String)>>,
+    journals_rx: Option<std::sync::mpsc::Receiver<Vec<engine::JournalSummary>>>,
+    confirm_rx: Option<std::sync::mpsc::Receiver<engine::Plan>>,
+    journals_dismissed: bool,
     status: String,
     phase: engine::Phase,
     percent: f32,
@@ -163,6 +168,8 @@ struct App {
     screenshot_requested: bool,
     frames: u32,
     scroll_to_result: bool,
+    /// Set when the window was asked to close during a transfer: it closes once the engine stops.
+    close_when_idle: bool,
     theme: Theme,
     palette: Palette,
     theme_locked: bool,
@@ -247,12 +254,27 @@ impl App {
         let theme = theme_override.unwrap_or_else(load_theme);
         let palette = Palette::of(theme);
 
-        let journals: Vec<engine::JournalSummary> = engine::unfinished_journals();
+        // Reading journals touches the disk, so it starts in the background and the dialog appears
+        // when the answer arrives.
+        let journals_rx = if screenshot.is_some() {
+            None
+        } else {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(engine::unfinished_journals());
+            });
+            Some(rx)
+        };
         let mut app = App {
             source: String::new(),
             dest: String::new(),
             preview: String::new(),
             preview_error: String::new(),
+            preview_gen: 0,
+            preview_rx: None,
+            journals_rx,
+            confirm_rx: None,
+            journals_dismissed: false,
             status: "Выберите папку и новое место".to_string(),
             phase: engine::Phase::Validate,
             percent: 0.0,
@@ -261,11 +283,12 @@ impl App {
             rx: None,
             confirm: None,
             result: None,
-            journals: if screenshot.is_some() { Vec::new() } else { journals },
+            journals: Vec::new(),
             screenshot,
             screenshot_requested: false,
             frames: 0,
             scroll_to_result: false,
+            close_when_idle: false,
             theme,
             palette,
             theme_locked: theme_override.is_some(),
@@ -382,20 +405,78 @@ impl App {
         if self.source.trim().is_empty() || self.dest.trim().is_empty() {
             self.preview.clear();
             self.preview_error.clear();
+            self.preview_rx = None;
+            self.confirm = None;
+            self.confirm_rx = None;
             return;
         }
-        let plan = engine::build_plan(&self.source, &self.dest);
-        if plan.valid {
-            self.preview = plan.dest_final.clone();
-            self.preview_error.clear();
-        } else {
-            self.preview.clear();
-            self.preview_error = plan.error.clone();
+        // The check touches the disk (a network path can take seconds), so it runs in the
+        // background and only the answer for the latest request is shown.
+        // A pending confirmation belongs to the old paths and must not be used any more.
+        self.confirm = None;
+        self.confirm_rx = None;
+        self.preview_gen += 1;
+        let generation = self.preview_gen;
+        let source = self.source.clone();
+        let dest = self.dest.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let plan = engine::build_plan(&source, &dest);
+            let answer = if plan.valid {
+                (generation, plan.dest_final.clone(), String::new())
+            } else {
+                (generation, String::new(), plan.error.clone())
+            };
+            let _ = tx.send(answer);
+        });
+        self.preview_rx = Some(rx);
+    }
+
+    fn pump_preview(&mut self) {
+        let mut answer = None;
+        if let Some(rx) = &self.preview_rx {
+            if let Ok(value) = rx.try_recv() {
+                answer = Some(value);
+            }
+        }
+        if let Some((generation, dest_final, error)) = answer {
+            self.preview_rx = None;
+            if generation != self.preview_gen {
+                return;
+            }
+            if error.is_empty() {
+                self.preview = dest_final;
+                self.preview_error.clear();
+            } else {
+                self.preview.clear();
+                self.preview_error = error;
+            }
         }
     }
 
-    fn browse(title: &str) -> Option<String> {
-        rfd::FileDialog::new().set_title(title).pick_folder().map(|p: PathBuf| p.to_string_lossy().to_string())
+    fn pump_journals(&mut self) {
+        let mut loaded = None;
+        if let Some(rx) = &self.journals_rx {
+            if let Ok(value) = rx.try_recv() {
+                loaded = Some(value);
+            }
+        }
+        if let Some(loaded) = loaded {
+            self.journals_rx = None;
+            // A list the person already dismissed must not come back.
+            if !self.journals_dismissed {
+                self.journals = loaded;
+            }
+        }
+    }
+
+    /// `None` — the dialog was cancelled; `Some(Err(..))` — the chosen name cannot be read as
+    /// Unicode, so it must not be silently replaced by a similar-looking path.
+    fn browse(title: &str) -> Option<Result<String, String>> {
+        rfd::FileDialog::new().set_title(title).pick_folder().map(|picked: PathBuf| match picked.to_str() {
+            Some(value) => Ok(value.to_string()),
+            None => Err("В имени выбранной папки есть символы, которые нельзя прочитать как Unicode.".to_string()),
+        })
     }
 
     fn start(&mut self, plan: engine::Plan) {
@@ -450,9 +531,25 @@ impl App {
             self.result = Some(outcome);
             self.scroll_to_result = true;
         }
+        // The confirmation of a transfer is computed off the UI thread as well.
+        let mut plan = None;
+        if let Some(rx) = &self.confirm_rx {
+            if let Ok(value) = rx.try_recv() {
+                plan = Some(value);
+            }
+        }
+        if let Some(plan) = plan {
+            self.confirm_rx = None;
+            if plan.valid {
+                self.confirm = Some(plan);
+            } else {
+                self.preview_error = plan.error.clone();
+                self.status = plan.error.clone();
+            }
+        }
     }
 
-    fn card(ui: &mut egui::Ui, palette: &Palette, title: &str, value: &mut String, browse: bool) -> bool {
+    fn card(ui: &mut egui::Ui, palette: &Palette, title: &str, value: &mut String, browse: bool, message: &mut Option<String>) -> bool {
         let mut changed = false;
         egui::Frame::none()
             .fill(palette.surface)
@@ -482,9 +579,15 @@ impl App {
                             egui::Button::new(egui::RichText::new("Обзор…").size(11.0)),
                         );
                         if button.clicked() {
-                            if let Some(picked) = App::browse("Выберите папку") {
-                                *value = picked;
-                                changed = true;
+                            match App::browse("Выберите папку") {
+                                Some(Ok(picked)) => {
+                                    *value = picked;
+                                    changed = true;
+                                }
+                                Some(Err(error)) => {
+                                    *message = Some(error);
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -495,7 +598,7 @@ impl App {
 
     fn footer(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let can_start = !self.running && !self.preview.is_empty();
+            let can_start = !self.running && self.confirm_rx.is_none() && !self.preview.is_empty();
             let start_text = if can_start { self.palette.on_accent } else { self.palette.on_disabled };
             let start = ui.add_enabled(
                 can_start,
@@ -505,12 +608,16 @@ impl App {
                     .min_size(egui::vec2(132.0, 28.0)),
             );
             if start.clicked() {
-                let plan = engine::build_plan(&self.source, &self.dest);
-                if plan.valid {
-                    self.confirm = Some(plan);
-                } else {
-                    self.preview_error = plan.error.clone();
-                }
+                // The final check touches the disk: run it in the background so a slow or
+                // unreachable path cannot freeze the window.
+                let source = self.source.clone();
+                let dest = self.dest.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(engine::build_plan(&source, &dest));
+                });
+                self.confirm_rx = Some(rx);
+                self.status = "Проверяю пути…".to_string();
             }
             if self.running {
                 let cancel_enabled = self.phase != engine::Phase::Publish
@@ -544,8 +651,25 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump();
+        self.pump_preview();
+        self.pump_journals();
+        // While a background answer is pending, wake up regularly: there is no event for it.
+        if self.preview_rx.is_some() || self.journals_rx.is_some() || self.confirm_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
         if self.running {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        // A running transfer must not be killed by closing the window: the click asks it to stop
+        // and the window closes as soon as the engine is back at a safe point.
+        if ctx.input(|input| input.viewport().close_requested()) && self.running {
+            self.cancel.store(true, Ordering::Relaxed);
+            self.status = "Останавливаю перенос… Окно закроется, когда это станет безопасно.".to_string();
+            self.close_when_idle = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if self.close_when_idle && !self.running {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if self.screenshot.is_some() {
             self.frames += 1;
@@ -594,9 +718,14 @@ impl eframe::App for App {
                     .auto_shrink([false, false])
                     .max_height(scroll_height)
                     .show(ui, |ui| {
-                        let mut changed = App::card(ui, &self.palette, "ОТКУДА", &mut self.source, true);
+                        let mut picked_error = None;
+                        let mut changed = App::card(ui, &self.palette, "ОТКУДА", &mut self.source, true, &mut picked_error);
                         ui.add_space(4.0);
-                        changed |= App::card(ui, &self.palette, "КУДА", &mut self.dest, true);
+                        changed |= App::card(ui, &self.palette, "КУДА", &mut self.dest, true, &mut picked_error);
+                        if let Some(error) = picked_error {
+                            self.preview_error = error;
+                            self.preview.clear();
+                        }
                         if changed {
                             self.refresh_preview();
                         }
@@ -798,6 +927,7 @@ impl eframe::App for App {
                 });
             if close {
                 self.journals.clear();
+                self.journals_dismissed = true;
             }
         }
     }
@@ -850,11 +980,11 @@ fn parse_cli(args: &[String]) -> Result<(CliCommand, CliFlags), String> {
             "--json" => flags.json = true,
             "--quiet" | "-q" => flags.quiet = true,
             "--dry-run" | "-n" => flags.dry_run = true,
-            "--transfer" | "/transfer" => verb = Some("transfer"),
-            "--plan" => verb = Some("plan"),
-            "--journals" => verb = Some("journals"),
-            "--version" | "-V" => verb = Some("version"),
-            "--help" | "-h" | "/?" => verb = Some("help"),
+            "--transfer" | "/transfer" => set_verb(&mut verb, "transfer")?,
+            "--plan" => set_verb(&mut verb, "plan")?,
+            "--journals" => set_verb(&mut verb, "journals")?,
+            "--version" | "-V" => set_verb(&mut verb, "version")?,
+            "--help" | "-h" | "/?" => set_verb(&mut verb, "help")?,
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("Неизвестный параметр: {}", other));
             }
@@ -898,6 +1028,20 @@ fn parse_cli(args: &[String]) -> Result<(CliCommand, CliFlags), String> {
     Ok((command, flags))
 }
 
+/// Accepts exactly one command: two different verbs on one line are a usage error, not "the last
+/// one wins".
+fn set_verb(verb: &mut Option<&'static str>, value: &'static str) -> Result<(), String> {
+    match verb {
+        Some(existing) if *existing != value => {
+            Err(format!("Указано несколько команд: --{} и --{}.", existing, value))
+        }
+        _ => {
+            *verb = Some(value);
+            Ok(())
+        }
+    }
+}
+
 fn json_bool(value: bool) -> &'static str {
     if value {
         "true"
@@ -939,16 +1083,20 @@ fn ensure_console() {
     unsafe {
         // Attach to the parent console even when stdout is redirected: otherwise stderr would stay
         // dead and the progress or an error message would be lost.
+        let mut owned_console = false;
         if GetConsoleWindow().is_null() && AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             let output_missing = !handle_is_valid(GetStdHandle(STD_OUTPUT_HANDLE));
             let errors_missing = !handle_is_valid(GetStdHandle(STD_ERROR_HANDLE));
             if output_missing || errors_missing {
-                AllocConsole();
+                owned_console = AllocConsole() != 0;
             }
         }
-        // The console receives UTF-8 bytes from Rust's std, so switch it to UTF-8 to show Cyrillic.
-        SetConsoleOutputCP(CP_UTF8);
-        SetConsoleCP(CP_UTF8);
+        // Only our own console may be switched to UTF-8: the parent console belongs to the caller,
+        // and its code page must stay as it was.
+        if owned_console {
+            SetConsoleOutputCP(CP_UTF8);
+            SetConsoleCP(CP_UTF8);
+        }
         for (std_id, device, read) in [
             (STD_OUTPUT_HANDLE, "CONOUT$", false),
             (STD_ERROR_HANDLE, "CONOUT$", false),
@@ -974,10 +1122,11 @@ unsafe extern "system" fn console_ctrl_handler(event: u32) -> i32 {
     const CTRL_C_EVENT: u32 = 0;
     const CTRL_BREAK_EVENT: u32 = 1;
     if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
-        if INTERRUPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-            CANCEL.store(true, Ordering::SeqCst);
-            return 1;
-        }
+        // Keep handling every Ctrl+C: returning 0 would restore the default handler and kill the
+        // process in the middle of publishing or linking, where the journal is the only safety net.
+        INTERRUPTS.fetch_add(1, Ordering::SeqCst);
+        CANCEL.store(true, Ordering::SeqCst);
+        return 1;
     }
     0
 }
@@ -1042,15 +1191,44 @@ impl engine::Sink for CliSink {
 
 /// Writes a line and ignores errors: a GUI-subsystem process may have no usable stdout.
 fn cli_out(line: &str) {
-    use std::io::Write;
-    let _ = writeln!(std::io::stdout(), "{}", line);
-    let _ = std::io::stdout().flush();
+    use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
+    write_line(STD_OUTPUT_HANDLE, line);
 }
 
 fn cli_err(line: &str) {
+    use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
+    write_line(STD_ERROR_HANDLE, line);
+}
+/// A console receives wide characters through `WriteConsoleW`, so Cyrillic is shown correctly no
+/// matter which code page the caller's console uses. A redirected handle gets plain UTF-8 bytes.
+fn write_line(std_id: u32, line: &str) {
     use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "{}", line);
-    let _ = std::io::stderr().flush();
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, WriteConsoleW, STD_OUTPUT_HANDLE,
+    };
+    const INVALID_HANDLE: isize = -1;
+    unsafe {
+        let handle = GetStdHandle(std_id);
+        let mut mode: u32 = 0;
+        if !handle.is_null()
+            && handle as isize != INVALID_HANDLE
+            && GetConsoleMode(handle, &mut mode) != 0
+        {
+            let mut units: Vec<u16> = line.encode_utf16().collect();
+            units.push(b'\r' as u16);
+            units.push(b'\n' as u16);
+            let mut written: u32 = 0;
+            WriteConsoleW(handle, units.as_ptr(), units.len() as u32, &mut written, std::ptr::null_mut());
+            return;
+        }
+    }
+    let stream: &mut dyn Write = if std_id == STD_OUTPUT_HANDLE {
+        &mut std::io::stdout()
+    } else {
+        &mut std::io::stderr()
+    };
+    let _ = writeln!(stream, "{}", line);
+    let _ = stream.flush();
 }
 
 fn help_text() -> String {
@@ -1185,10 +1363,8 @@ fn run_transfer(source: &str, dest: &str, flags: &CliFlags) -> i32 {
         return EXIT_FAILED;
     }
     install_ctrl_c();
-    if !flags.quiet && !flags.json {
-        cli_err(&format!("Перенос: {} -> {}", plan.source, plan.dest_final));
-    }
-    let sink = CliSink::new(flags.quiet || flags.json);
+    // Progress goes to stderr and is off only with --quiet: --json controls stdout, not stderr.
+    let sink = CliSink::new(flags.quiet);
     let outcome = engine::execute(&plan, Some(&sink), &engine::Faults::default());
     if flags.json {
         cli_out(&json_outcome(&plan, &outcome));
@@ -1241,8 +1417,33 @@ fn window_icon() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: image.as_raw().clone(), width: image.width(), height: image.height() })
 }
 
+/// Converts the raw command line strictly, keeping the arguments that are readable.
+/// The flag means "some argument could not be read as Unicode": those must not be silently
+/// replaced, but the readable ones still decide how the error is reported (`--json`).
+fn collect_args<I: Iterator<Item = std::ffi::OsString>>(values: I) -> (Vec<String>, bool) {
+    let mut result = Vec::new();
+    let mut unreadable = false;
+    for value in values {
+        match value.to_str() {
+            Some(text) => result.push(text.to_string()),
+            None => unreadable = true,
+        }
+    }
+    (result, unreadable)
+}
+
 fn main() -> eframe::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Non-Unicode arguments must not panic, and must not silently open the window either: they are
+    // reported as a usage error with code 2 whatever mode was intended.
+    let (args, unreadable) = collect_args(std::env::args_os().skip(1));
+    if unreadable {
+        ensure_console();
+        let code = report_usage_error(
+            &args,
+            "Аргумент содержит символы, которые нельзя прочитать как Unicode.",
+        );
+        std::process::exit(code);
+    }
     let cli = args.iter().any(|arg| {
         matches!(
             arg.as_str(),
@@ -1374,6 +1575,21 @@ mod cli_tests {
             command,
             CliCommand::Plan { source: "-odd".to_string(), dest: "-dest".to_string() }
         );
+        // After `--` a word that looks like a flag is a path, not a command.
+        let (command, flags) = parse_cli(&args(&["--transfer", "--", "--json", "dest"])).unwrap();
+        assert_eq!(
+            command,
+            CliCommand::Transfer { source: "--json".to_string(), dest: "dest".to_string() }
+        );
+        assert!(!flags.json);
+    }
+
+    #[test]
+    fn two_commands_on_one_line_are_refused() {
+        assert!(parse_cli(&args(&["--transfer", "a", "b", "--journals"])).is_err());
+        assert!(parse_cli(&args(&["--version", "--help"])).is_err());
+        // Repeating the same command is harmless and still a usage error only if paths disagree.
+        assert!(parse_cli(&args(&["--journals", "--journals"])).is_ok());
     }
 
     #[test]
@@ -1389,5 +1605,26 @@ mod cli_tests {
         assert_eq!(json_escape("a\"b\\c\nd\te"), "a\\\"b\\\\c\\nd\\te");
         assert_eq!(json_escape("Готово"), "Готово");
         assert_eq!(json_escape("\u{1}"), "\\u0001");
+    }
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    #[test]
+    fn unreadable_arguments_are_refused_but_keep_the_flags() {
+        let (good, bad) = collect_args(vec![OsString::from("--plan"), OsString::from("a")].into_iter());
+        assert_eq!(good, vec!["--plan".to_string(), "a".to_string()]);
+        assert!(!bad);
+        // An unpaired surrogate cannot be converted: silently replacing it would be worse. The
+        // readable flags are still kept, so `--json` can shape the error message.
+        let (kept, bad) = collect_args(
+            vec![OsString::from("--json"), OsString::from_wide(&[0xD800]), OsString::from("--plan")].into_iter(),
+        );
+        assert!(bad);
+        assert_eq!(kept, vec!["--json".to_string(), "--plan".to_string()]);
     }
 }

@@ -152,7 +152,8 @@ pub fn canonical(path: &str) -> Option<String> {
         }
         if (length as usize) < buffer.len() {
             buffer.truncate(length as usize);
-            text = Some(strip_long_prefix(&String::from_utf16_lossy(&buffer)));
+            // Strict: a substituted character would open a different object than the user chose.
+            text = String::from_utf16(&buffer).ok().map(|value| strip_long_prefix(&value));
             break;
         }
         size = (length as usize) + 1;
@@ -500,7 +501,13 @@ pub fn streams(path: &str) -> Result<Vec<StreamInfo>, u32> {
         let units: Vec<u16> = buffer[name_start..name_end].chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
-        let name = String::from_utf16_lossy(&units);
+        let name = match String::from_utf16(&units) {
+            Ok(value) => value,
+            Err(_) => {
+                close(handle);
+                return Err(INVALID_DATA);
+            }
+        };
         if name != "::$DATA" {
             let mut clean = name.clone();
             if clean.starts_with(':') {
@@ -552,7 +559,8 @@ fn read_unicode(raw: &[u8], base: usize, offset: usize, length: usize) -> Result
     let units: Vec<u16> = raw[start..end].chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
-    Ok(String::from_utf16_lossy(&units))
+    // A lossy conversion would silently point the link at another object.
+    String::from_utf16(&units).map_err(|_| INVALID_DATA)
 }
 
 fn reparse_of_handle(handle: HANDLE) -> Result<Reparse, u32> {
@@ -575,36 +583,75 @@ fn parse_reparse(buffer: &[u8]) -> Result<Reparse, u32> {
         return Err(INVALID_DATA);
     }
     let tag = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-    let size = u16::from_le_bytes([buffer[4], buffer[5]]) as usize;
-    // The declared block must agree with the data we actually received.
-    if size < 8 || size > buffer.len() {
+    // ReparseDataLength counts only the data that follows the 8-byte header, so the full block is
+    // 8 + length. Treating it as the whole size used to cut the last 8 bytes off a junction.
+    let data_length = u16::from_le_bytes([buffer[4], buffer[5]]) as usize;
+    let total = 8usize.checked_add(data_length).ok_or(INVALID_DATA)?;
+    if total > buffer.len() {
         return Err(INVALID_DATA);
     }
     let (base, substitute, relative) = if tag == IO_REPARSE_TAG_SYMLINK {
-        if size < 20 {
+        // Tag header: 4 offsets/lengths (8 bytes) + flags (4 bytes).
+        if total < 20 {
             return Err(INVALID_DATA);
         }
         let offset = u16::from_le_bytes([buffer[8], buffer[9]]) as usize;
         let length = u16::from_le_bytes([buffer[10], buffer[11]]) as usize;
         let flags = u32::from_le_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]);
-        (20usize, read_unicode(buffer, 20, offset, length)?, (flags & 1) != 0)
+        (20usize, read_unicode(&buffer[..total], 20, offset, length)?, (flags & 1) != 0)
     } else if tag == IO_REPARSE_TAG_MOUNT_POINT {
-        if size < 16 {
+        // Tag header: 4 offsets/lengths (8 bytes), no flags.
+        if total < 16 {
             return Err(INVALID_DATA);
         }
         let offset = u16::from_le_bytes([buffer[8], buffer[9]]) as usize;
         let length = u16::from_le_bytes([buffer[10], buffer[11]]) as usize;
-        (16usize, read_unicode(buffer, 16, offset, length)?, false)
+        (16usize, read_unicode(&buffer[..total], 16, offset, length)?, false)
     } else {
         return Err(INVALID_DATA);
     };
     let _ = base;
-    Ok(Reparse { tag, substitute, relative, raw: buffer[..size].to_vec() })
+    Ok(Reparse { tag, substitute, relative, raw: buffer[..total].to_vec() })
 }
 
 pub fn read_reparse(path: &str) -> Result<Reparse, u32> {
     let guard = Guard::open(path, FILE_READ_ATTRIBUTES, false)?;
     guard.reparse()
+}
+
+/// Builds a mount-point (junction) reparse block that points at `target`.
+/// Used when the original junction pointed inside the moved folder and must be redirected.
+pub fn junction_block(target: &str) -> Vec<u8> {
+    let substitute = format!("\\??\\{}", target);
+    let substitute_units: Vec<u16> = substitute.encode_utf16().collect();
+    let print_units: Vec<u16> = target.encode_utf16().collect();
+    // Windows counts the name bytes without the terminating NUL, then writes one extra NUL word
+    // after each name: fields, substitute, NUL, print, NUL.
+    let substitute_len = (substitute_units.len() * 2) as u16;
+    let print_len = (print_units.len() * 2) as u16;
+    let print_offset = substitute_len.saturating_add(2);
+    let data_len = 8u16
+        .saturating_add(substitute_len)
+        .saturating_add(2)
+        .saturating_add(print_len)
+        .saturating_add(2);
+    let mut block = Vec::with_capacity(8 + data_len as usize);
+    block.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    block.extend_from_slice(&data_len.to_le_bytes());
+    block.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    block.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
+    block.extend_from_slice(&substitute_len.to_le_bytes());
+    block.extend_from_slice(&print_offset.to_le_bytes());
+    block.extend_from_slice(&print_len.to_le_bytes());
+    for unit in substitute_units {
+        block.extend_from_slice(&unit.to_le_bytes());
+    }
+    block.extend_from_slice(&0u16.to_le_bytes());
+    for unit in print_units {
+        block.extend_from_slice(&unit.to_le_bytes());
+    }
+    block.extend_from_slice(&0u16.to_le_bytes());
+    block
 }
 
 pub fn write_junction(dir: &str, raw: &[u8]) -> bool {
@@ -856,7 +903,7 @@ pub fn volume_root(path: &str) -> Option<String> {
         return None;
     }
     let length = buffer.iter().position(|v| *v == 0).unwrap_or(buffer.len());
-    Some(strip_long_prefix(&String::from_utf16_lossy(&buffer[..length])))
+    String::from_utf16(&buffer[..length]).ok().map(|value| strip_long_prefix(&value))
 }
 
 pub struct VolumeInfo {
@@ -903,7 +950,7 @@ pub fn volume_device(path: &str) -> Option<(String, u64)> {
     };
     let device = if ok != 0 {
         let length = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
-        String::from_utf16_lossy(&buffer[..length])
+        String::from_utf16(&buffer[..length]).ok()?
     } else if is_drive_root(&root) {
         // Only a real drive root may fall back to `\\.\X:`; for a folder mount point the first two
         // characters name the host drive, not the volume that holds the data.
@@ -982,14 +1029,15 @@ pub fn path_exists(path: &str) -> bool {
 }
 
 pub fn parent(path: &str) -> String {
-    match Path::new(path).parent() {
-        Some(value) => value.to_string_lossy().to_string(),
+    // Strict: a substituted character would point at another folder.
+    match Path::new(path).parent().and_then(|value| value.to_str()) {
+        Some(value) => value.to_string(),
         None => String::new(),
     }
 }
 
 pub fn leaf(path: &str) -> String {
-    Path::new(path).file_name().map(|v| v.to_string_lossy().to_string()).unwrap_or_default()
+    Path::new(path).file_name().and_then(|value| value.to_str()).map(|value| value.to_string()).unwrap_or_default()
 }
 
 pub fn join(base: &str, name: &str) -> String {
