@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "linkerino"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "eframe",
  "image",

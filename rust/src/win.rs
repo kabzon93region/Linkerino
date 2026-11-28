@@ -273,6 +273,19 @@ impl Guard {
         }
     }
 
+    /// Opens an object so that nothing can write to it while the handle is held: the share mode
+    /// admits reads only. A check made on the object between this open and the close therefore
+    /// still describes it when the handle is released.
+    pub fn open_no_write(path: &str, access: u32, follow_reparse: bool) -> Result<Guard, u32> {
+        let flags = FILE_FLAG_BACKUP_SEMANTICS | if follow_reparse { 0 } else { FILE_FLAG_OPEN_REPARSE_POINT };
+        let handle = open(path, access, FILE_SHARE_READ, OPEN_EXISTING, flags);
+        if handle == INVALID {
+            Err(last_error())
+        } else {
+            Ok(Guard { handle })
+        }
+    }
+
     /// Creates a new file and keeps it open with no sharing, so nothing else can read it while
     /// the data is being written. `write_dac` asks for the right to apply the source DACL before
     /// the handle is closed.
@@ -1088,4 +1101,34 @@ pub fn read_whole(path: &str) -> Option<Vec<u8>> {
 
 pub fn write_whole(path: &str, data: &[u8]) -> bool {
     std::fs::write(path, data).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cleanup relies on this hold: a program must not be able to open the object for writing
+    /// while the check that precedes a backup deletion is still valid.
+    #[test]
+    fn open_no_write_refuses_a_writer_until_it_is_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "linkerino-open-no-write-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, b"payload").expect("create the probe file");
+        let text = path.to_string_lossy().to_string();
+        let guard = Guard::open_no_write(&text, READ_DATA_ACCESS | READ_ATTRIBUTES_ACCESS, false)
+            .expect("open the probe file without write sharing");
+        let blocked = std::fs::OpenOptions::new().write(true).open(&path);
+        assert!(blocked.is_err(), "a writer must be refused while the guard is held: {:?}", blocked.err());
+        drop(guard);
+        let allowed = std::fs::OpenOptions::new().write(true).open(&path);
+        assert!(allowed.is_ok(), "a writer must succeed after the guard is closed: {:?}", allowed.err());
+        drop(allowed);
+        let _ = std::fs::remove_file(&path);
+    }
 }

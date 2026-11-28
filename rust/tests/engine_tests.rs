@@ -381,6 +381,84 @@ fn flush_failure_keeps_the_backup() {
 }
 
 #[test]
+fn copy_changed_after_final_verification_keeps_the_backup() {
+    init_journals();
+    let root = temp_root();
+    require_symlinks(&root);
+    let source = root.join("src").join("Data");
+    let dest_parent = root.join("dest");
+    let stream_path = |dir: &Path| {
+        PathBuf::from(format!("{}:test-stream:$DATA", dir.join("file.txt").display()))
+    };
+    write(&source.join("file.txt"), b"payload");
+    write(&stream_path(&source), b"original stream");
+    write(&source.join("nested").join("more.txt"), b"more payload");
+    fs::create_dir_all(&dest_parent).unwrap();
+    let plan = engine::build_plan(&source.to_string_lossy(), &dest_parent.to_string_lossy());
+    assert!(plan.valid, "{}", plan.error);
+    let faults = Faults {
+        before_backup_delete: Some(|plan| {
+            let file = Path::new(&plan.dest_final).join("file.txt");
+            assert_eq!(read(&file), b"payload");
+            fs::write(file, b"changed").expect("change the verified copy");
+        }),
+        ..Default::default()
+    };
+    let outcome = engine::execute(&plan, None, &faults);
+    let dest = Path::new(&plan.dest_final);
+    let backup = Path::new(&plan.backup);
+    let link_valid = link_points_to(&source, dest);
+    let copy_data = fs::read(dest.join("file.txt"));
+    let backup_root = backup.is_dir();
+    let backup_data = fs::read(backup.join("file.txt"));
+    let backup_nested = fs::read(backup.join("nested").join("more.txt"));
+    let backup_stream = fs::read(stream_path(backup));
+    let journal_state = journal_state_for(Path::new(&plan.source));
+    cleanup(&root);
+
+    assert!(link_valid, "expected the published copy: {}", outcome.message);
+    assert_eq!(copy_data.unwrap(), b"changed", "the test action did not run");
+    // The whole backup is kept, not just the object that changed: nothing was deleted before the
+    // copy was checked again.
+    assert!(backup_root, "the backup folder must stay: {} (leftover: {})", outcome.message, outcome.leftover);
+    assert_eq!(
+        backup_data.as_deref().ok(),
+        Some(b"payload".as_slice()),
+        "original file must survive the change to the verified copy: {} / {} (leftover: {})",
+        outcome.message,
+        outcome.detail,
+        outcome.leftover
+    );
+    assert_eq!(
+        backup_nested.as_deref().ok(),
+        Some(b"more payload".as_slice()),
+        "the untouched part of the backup must stay as well: {}",
+        outcome.message
+    );
+    assert_eq!(backup_stream.unwrap(), b"original stream");
+    assert!(outcome.ok, "the transfer itself is complete: {}", outcome.message);
+    assert!(outcome.message.contains("двух местах"), "{}", outcome.message);
+    assert_eq!(outcome.leftover, plan.backup);
+    assert_eq!(journal_state.as_deref(), Some("cleanup-skipped"), "{:?}", outcome.detail);
+}
+
+/// Reads the state line of the journal that belongs to one transfer.
+fn journal_state_for(source: &Path) -> Option<String> {
+    let dir = std::env::var("LINKERINO_JOURNAL_DIR").ok()?;
+    let escaped = source.to_string_lossy().replace('\\', "\\\\");
+    for item in fs::read_dir(dir).ok()?.flatten() {
+        let Ok(text) = fs::read_to_string(item.path()) else { continue };
+        if !text.contains(&escaped) {
+            continue;
+        }
+        return text
+            .lines()
+            .find_map(|line| line.strip_prefix("state=").map(|value| value.trim().to_string()));
+    }
+    None
+}
+
+#[test]
 fn extra_object_in_copy_is_rejected() {
     let root = temp_root();
     require_symlinks(&root);
@@ -520,6 +598,91 @@ fn plan_is_revalidated_before_any_change() {
     assert!(!win::path_exists(&plan.staging), "staging must not be left behind");
     assert!(source.join("other.txt").exists(), "the current folder must stay untouched");
     cleanup(&root);
+}
+
+#[test]
+fn journal_inside_source_is_rejected_before_writing() {
+    let root = temp_root();
+    require_symlinks(&root);
+    let (source, dest_parent, plan) = prepare(&root);
+    let journal_dir = source.join("journals");
+    // Scope the journal override to this child so parallel tests keep their own journal location.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_Linkerino"))
+        .env("LINKERINO_JOURNAL_DIR", &journal_dir)
+        .args(["--transfer", "--json", "--quiet"])
+        .arg(&source)
+        .arg(&dest_parent)
+        .output()
+        .expect("run Linkerino with a journal directory inside the source");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let source_id = win::object_id(&plan.source, true);
+    let source_data = fs::read(source.join("file.txt"));
+    let journal_not_created = matches!(
+        fs::symlink_metadata(&journal_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    let dest_empty = fs::read_dir(&dest_parent).unwrap().next().is_none();
+    cleanup(&root);
+
+    assert_eq!(source_id, Some(plan.source_id), "the source folder was replaced: {stdout}");
+    assert_eq!(source_data.unwrap(), b"payload");
+    assert!(journal_not_created, "the source tree must not get a journal directory: {stdout}");
+    assert!(dest_empty, "the destination must stay empty: {stdout}");
+    assert_eq!(output.status.code(), Some(1), "expected a refusal: {stdout}");
+    assert!(stdout.to_lowercase().contains("журнал"), "expected a journal diagnostic: {stdout}");
+}
+
+#[test]
+fn journal_beside_the_source_does_not_block_the_move() {
+    let root = temp_root();
+    require_symlinks(&root);
+    let (source, dest_parent, _plan) = prepare(&root);
+    // A folder next to the source is not inside it: the refusal must not appear here.
+    let journal_dir = root.join("journals");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_Linkerino"))
+        .env("LINKERINO_JOURNAL_DIR", &journal_dir)
+        .args(["--transfer", "--json", "--quiet"])
+        .arg(&source)
+        .arg(&dest_parent)
+        .output()
+        .expect("run Linkerino with the journal folder beside the source");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let linked = win::is_reparse(&source.to_string_lossy());
+    let copied = dest_parent.join("Data").join("file.txt");
+    let copied_data = fs::read(&copied);
+    cleanup(&root);
+
+    assert_eq!(output.status.code(), Some(0), "a journal folder beside the source must not block: {stdout}");
+    assert!(linked, "the source must become a link: {stdout}");
+    assert_eq!(copied_data.unwrap(), b"payload");
+}
+
+#[test]
+fn journal_inside_the_future_copy_is_refused_before_writing() {
+    let root = temp_root();
+    require_symlinks(&root);
+    let (source, dest_parent, _plan) = prepare(&root);
+    let journal_dir = dest_parent.join("Data").join("journals");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_Linkerino"))
+        .env("LINKERINO_JOURNAL_DIR", &journal_dir)
+        .args(["--transfer", "--json", "--quiet"])
+        .arg(&source)
+        .arg(&dest_parent)
+        .output()
+        .expect("run Linkerino with a journal folder inside the future copy");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let linked = win::is_reparse(&source.to_string_lossy());
+    let journal_created = win::path_exists(&journal_dir.to_string_lossy());
+    let copy_created = win::path_exists(&dest_parent.join("Data").to_string_lossy());
+    let source_data = fs::read(source.join("file.txt"));
+    cleanup(&root);
+
+    assert_eq!(output.status.code(), Some(1), "expected a refusal: {stdout}");
+    assert!(stdout.to_lowercase().contains("журнал"), "expected a journal diagnostic: {stdout}");
+    assert!(!linked, "the source must stay a real folder: {stdout}");
+    assert!(!journal_created, "the journal folder must not be created: {stdout}");
+    assert!(!copy_created, "the copy must not be created: {stdout}");
+    assert_eq!(source_data.unwrap(), b"payload");
 }
 
 #[test]
